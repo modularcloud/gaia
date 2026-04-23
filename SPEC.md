@@ -41,8 +41,22 @@ code changes the session merged into the caller's current branch.
   `gaia`. There is no `.gaia-prompts/` directory, no `--workflow` flag.
 - **No support for non-GitHub hosts** — required by the underlying
   routines spawner.
-- **No Zero Data Retention support** — blocked upstream. Claude Code on
-  the web / cloud sessions are unavailable for ZDR-enabled orgs.
+- **No Zero Data Retention support.** ZDR is generally available on
+  Claude Code Enterprise, but orgs with ZDR enabled cannot use
+  cloud-session features — routines, `/web-setup`, and the endpoints
+  gaia fires against are all blocked for them. The rest of Claude
+  Code still works under ZDR; only the cloud-session transport gaia
+  depends on is unavailable.
+- **No coexistence with pre-existing project-level `UserPromptSubmit`,
+  `Stop`, or `StopFailure` hooks.** Those three events do not accept
+  matchers — Claude Code runs every registered handler in parallel
+  and combines decisions by picking the most restrictive. gaia cannot
+  safely share any of those events with another hook that might race
+  its checkout, block its run, or mutate the conversation. `gaia init`
+  refuses to install into a repo that already defines any of the
+  three (§5, §6.4, §8.6). Composing with pre-existing hooks is
+  deferred to v1.x (§14) and is a non-breaking addition when it
+  lands.
 - **No local Claude invocation.** v1 always goes through a cloud routine.
 
 ## 3. Architecture
@@ -113,11 +127,14 @@ the web enabled. ZDR orgs are blocked.
    prompt from §9 and an API trigger.
 3. `GAIA_ROUTINE_URL` and `GAIA_ROUTINE_TOKEN` stored locally via
    `gaia config set`.
-4. `.claude/settings.json` and `.claude/hooks/*.sh` committed to the
+4. `.claude/settings.json` and `.claude/hooks/*.js` committed to the
    repo root and **merged to the default branch** (see note below).
    `gaia init` writes these files and, if the current branch is not the
    default branch, either opens a PR on the user's behalf (if `gh` is
-   available) or prints the exact git commands to run.
+   available) or prints the exact git commands to run. If the repo
+   already defines any project-level `UserPromptSubmit`, `Stop`, or
+   `StopFailure` hook, `gaia init` refuses to proceed and points at
+   the remediation path in §8.6.
 5. `.gitignore` entry for `.gaia/` (local state only). `gaia init`
    appends this.
 6. The Claude GitHub App installed on the repo. Routines can push to
@@ -210,6 +227,32 @@ as a distinct, actionable exit code:
 7. On full success, delete the remote work / state branches and
    finalize history.
 
+#### 6.1.2 `--no-merge`
+
+When the caller passes `--no-merge`, the driver executes §6.1 steps
+1–8 (push, fire, poll, fetch, copy transcripts) and step 10 (print
+the final assistant message to stdout), then **skips steps 9 and 12**
+(merge-back, remote-branch deletion). Concretely:
+
+- `meta.json.status` and the corresponding `history.jsonl.status` are
+  set to `"no-merge"`. This is a terminal state — distinct from
+  `"success"` (merged) and from `"conflict"` / `"timeout"` (failures
+  — see §10.3).
+- `claude/gaia/$RUN_ID/{work,state}` are preserved on origin, as if
+  `--keep-branches` were also set.
+- stdout carries the final assistant message, exactly as in a merged
+  run.
+- stderr carries one line with the work-branch name and a
+  `gaia recover <run_id>` hint so the caller can complete the merge
+  later.
+- Exit code is `0`. `--no-merge` is an intentional caller request,
+  not a failure.
+- `gaia -c` scoped to the current branch **does not** pick up
+  `"no-merge"` runs (it only continues `"success"`). Use
+  `--resume <session_id>` to explicitly continue a no-merge run's
+  transcript, or `gaia recover <run_id>` to complete the merge and
+  promote the run to `"success"` first.
+
 Exit codes:
 
 | Code | Meaning |
@@ -294,7 +337,7 @@ routines surface exposes it (§14).
 | `-p` | (required) | Print mode / one-shot. Required for every non-admin invocation. |
 | `-c` / `--continue` | off | Prepend the most recent successful session's transcript. Scoped to current branch. |
 | `--resume <session_id>` | off | Prepend a specific session's transcript. Mutually exclusive with `-c`. Works across branches. |
-| `--no-merge` | off | Stop after "sentinel received." Leave work branch for manual review. |
+| `--no-merge` | off | After the `GAIA_DONE:` sentinel arrives, skip the merge-back in §6.1.1 entirely. See §6.1.2 for exact semantics (history status, branch retention, stdout behavior, exit code). |
 | `--keep-branches` | off | Do not delete `claude/gaia/$RUN_ID/*` on origin after merge. |
 | `--spawner <name>` | from config | Override the spawner. |
 | `--timeout <duration>` | `45m` | Per-session timeout. |
@@ -319,9 +362,12 @@ gaia version
 `gaia init`:
 1. Prompts for routine URL + token; stores them securely.
 2. Writes `gaia.config.json` to the repo root.
-3. Writes `.claude/settings.json` and `.claude/hooks/*.sh` to the repo
-   root (§8). If `.claude/settings.json` exists, merges the `hooks`
-   key non-destructively.
+3. Writes `.claude/settings.json` and `.claude/hooks/*.js` to the repo
+   root (§8). If `.claude/settings.json` exists **but does not already
+   define `UserPromptSubmit`, `Stop`, or `StopFailure` hooks**, merges
+   the remaining `hooks` key non-destructively. If it does define any
+   of those three events, `gaia init` aborts with the error documented
+   in §8.6 (hook coexistence) and offers migration guidance.
 4. Appends `.gaia/` to `.gitignore`.
 5. Prints the saved routine prompt (§9) for the user to paste into the
    Claude Code routines UI.
@@ -345,6 +391,14 @@ See §8.4 for the doctor checklist.
 `gaia recover <id>` resolves a stuck run without needing the original
 invocation's process to still be alive:
 - Looks up `.gaia/runs/<run_id>/meta.json` (or finds by session_id).
+- **Always targets the `user_branch` recorded in `meta.json`**, not
+  the caller's current checkout. If the current branch differs from
+  the recorded one, `gaia recover` requires a clean working tree and
+  checks out the recorded branch before merging; it aborts with exit
+  2 if the tree is dirty. On success, the caller is left on the
+  recorded `user_branch`. This guarantees that a run's changes land
+  where the original caller intended, regardless of where the caller
+  happens to be now.
 - Fetches the preserved `claude/gaia/$RUN_ID/{work,state}` branches.
 - If a sentinel exists on the state branch, completes the merge
   transactionally (§6.1.1), finalizes history, and deletes remote
@@ -352,6 +406,9 @@ invocation's process to still be alive:
 - If not, prints the `session_url` and work-branch name for manual
   review, and offers to re-run `-c` via transcript replay against
   whatever transcript was captured pre-failure.
+- For runs with `status: "no-merge"`, `gaia recover` runs the same
+  merge-back path and promotes the status to `"success"` on
+  completion.
 
 ## 7. Protocol
 
@@ -432,19 +489,27 @@ branch *before* firing and replaces it in the payload with:
 ```
 
 The `UserPromptSubmit` hook (§8.1) detects this marker, fetches the
-state branch, copies `.gaia-state/context.md` into the **work-tree**
+state branch, and copies `.gaia-state/context.md` into the **work-tree**
 at `.gaia/runs/<run_id>/context.md` (gitignored, so the Stop hook's
-`git add -A` will not commit it), and returns a `hookSpecificOutput`
-that rewrites the submitted prompt — replacing the marker with inline
-text instructing Claude to `Read .gaia/runs/<run_id>/context.md`
-before acting. This is the mechanism Claude's model actually sees; the
-saved routine prompt (§9) only has to know that a context-file
-reference means "read that file."
+`git add -A` will not commit it). The hook then returns
+`hookSpecificOutput.additionalContext` pointing Claude at the file;
+Claude Code injects that string as a system reminder the model sees
+alongside the original prompt.
 
-Note: `additionalContext` from `UserPromptSubmit` hooks is truncated
-at 10,000 characters in current Claude Code — too small for large
-overflow. Materializing to a worktree file and rewriting the prompt
-avoids the limit entirely.
+Prompt-rewriting is deliberately not used. Current `UserPromptSubmit`
+hook output supports `additionalContext` and `sessionTitle` but does
+not expose a documented `updatedPrompt` field. The `--- CONTEXT
+FILE ---` marker therefore stays in the submitted prompt verbatim —
+it is a human-visible crumb; the load-bearing instruction travels via
+the system-reminder injection. The saved routine prompt (§9) only has
+to know that a context-file reference means "read that file."
+
+Note on size: Claude Code automatically spills `additionalContext`
+over 10,000 characters into a file and replaces the text with a
+preview/path before the model sees it. gaia's injected context is a
+short pointer ("read this file"), well under the limit, so the
+overflow content remains in the git-tracked `context.md` under gaia's
+control rather than going through Claude Code's internal spill path.
 
 ### 7.3 Sentinels and artifacts
 
@@ -510,8 +575,8 @@ Installed by `gaia init` under the repo root:
 .claude/
   settings.json
   hooks/
-    gaia-user-prompt-submit.sh
-    gaia-stop.sh
+    gaia-user-prompt-submit.js
+    gaia-stop.js
 ```
 
 `.claude/settings.json`:
@@ -524,7 +589,7 @@ Installed by `gaia init` under the repo root:
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/gaia-user-prompt-submit.sh",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/gaia-user-prompt-submit.js\"",
             "timeout": 120
           }
         ]
@@ -535,7 +600,7 @@ Installed by `gaia init` under the repo root:
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/gaia-stop.sh",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/gaia-stop.js\"",
             "timeout": 600
           }
         ]
@@ -546,7 +611,7 @@ Installed by `gaia init` under the repo root:
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/gaia-stop.sh",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/gaia-stop.js\"",
             "timeout": 120
           }
         ]
@@ -555,6 +620,23 @@ Installed by `gaia init` under the repo root:
   }
 }
 ```
+
+**Why `$CLAUDE_PROJECT_DIR`, not a relative path.** Hook commands
+execute with the session's current working directory, which Claude may
+have `cd`d into a subdirectory before `Stop` or `UserPromptSubmit`
+fires. A bare relative path (`.claude/hooks/…`) would silently break
+in those cases. `$CLAUDE_PROJECT_DIR` is expanded by Claude Code to
+the repo root regardless of the current directory, so the shim always
+resolves.
+
+**Why Node shims, not `.sh`.** Claude Code requires Node on every
+machine it runs on, and the gaia driver is already Node. Node shims
+work unchanged on Linux, macOS, and Windows — teammates on any OS who
+open Claude Code locally in the repo see the shims no-op cleanly for
+non-gaia sessions instead of hitting an unexecutable `.sh` on Windows.
+The shim logic (inspect stdin, delegate to the global binary) is
+trivial in Node. Future work (§14) may add native POSIX-only shims as
+an opt-in for repos that want to minimize dependencies.
 
 Schema notes:
 
@@ -586,8 +668,8 @@ Project-level install is chosen over `~/.claude/settings.json` because:
 
 ### 8.0 Shim scripts
 
-`.claude/hooks/gaia-user-prompt-submit.sh` and
-`.claude/hooks/gaia-stop.sh` are small shell scripts committed to the
+`.claude/hooks/gaia-user-prompt-submit.js` and
+`.claude/hooks/gaia-stop.js` are small Node scripts committed to the
 repo. Each:
 
 1. Reads hook stdin (JSON) into memory.
@@ -597,14 +679,19 @@ repo. Each:
    `/tmp/gaia/<session_id>.json` does not exist (the
    `UserPromptSubmit` hook writes this file only when it recognizes a
    gaia session).
-4. Otherwise, locates the global `gaia-hook-*` binary on `$PATH` and
-   `exec`s it with the original stdin. If the binary is absent, emits
-   a single-line warning to stderr and exits 0 so the hook does not
-   block a teammate's non-gaia Claude Code session.
+4. Otherwise, locates the global `gaia-hook-*` binary on `$PATH`
+   (`which` / `where` equivalent via Node's `child_process` +
+   `process.env.PATH`) and spawns it with the original stdin, piping
+   stdout/stderr through. Exits with the child's exit code. If the
+   binary is absent, emits a single-line warning to stderr and exits
+   0 so the hook does not block a teammate's non-gaia Claude Code
+   session.
 
 This means a teammate who opens Claude Code on the repo without gaia
 installed sees no disruption: the shim runs, recognizes the session is
 not a gaia session (or the binary is absent), and returns silently.
+Because the shim is Node, it runs identically on Windows, macOS, and
+Linux — no Git Bash / WSL requirement for teammates on Windows.
 
 ### 8.1 `gaia-hook-user-prompt-submit`
 
@@ -634,19 +721,26 @@ Fires on every user prompt submission. Blocks until it returns.
    if the manifest's `nonce` does not match the prompt's
    `GAIA_NONCE:`, or if any branch name in the manifest disagrees with
    the prompt. On mismatch, exit non-zero.
-4. Persist the branch names so Claude's later Bash tool calls can
-   read them without relying on hook-exported environment variables
-   (current Claude Code does not inject hook env vars into the Bash
-   tool's process for `UserPromptSubmit`):
+4. Write `/tmp/gaia/<session_id>.json` with
+   `{run_id, work_branch, state_branch, experimental_mode}` — this is
+   the **authoritative** per-session record. The `Stop` /
+   `StopFailure` hook (§8.2) reads its branch names from this file,
+   keyed by `session_id`, regardless of what Claude did to the
+   worktree or git config during the session.
+5. **Convenience-only** side channel for Claude's own Bash tool
+   reads: persist the same values to git config so prompts that read
+   them via `git config --get gaia.workBranch` (see §9) work without
+   hook-exported environment variables (current Claude Code does not
+   inject hook env vars into the Bash tool's process for
+   `UserPromptSubmit`):
    ```
    git config gaia.runId "$GAIA_RUN_ID"
    git config gaia.workBranch "$GAIA_WORK_BRANCH"
    git config gaia.stateBranch "$GAIA_STATE_BRANCH"
    git config gaia.experimentalMode "$GAIA_EXPERIMENTAL_MODE"   # if present
    ```
-5. Write `/tmp/gaia/<session_id>.json` with
-   `{run_id, work_branch, state_branch, experimental_mode}` so the
-   `Stop` / `StopFailure` hook can correlate by `session_id`.
+   If the agent overwrites these values during the session, gaia's
+   hooks are unaffected — they read from the tmp file.
 6. Fetch and check out the work branch:
    ```
    git fetch origin "$GAIA_WORK_BRANCH"
@@ -655,16 +749,21 @@ Fires on every user prompt submission. Blocks until it returns.
 7. If the payload contains `--- CONTEXT FILE ---`, fetch the state
    branch, copy `.gaia-state/context.md` into the worktree at
    `.gaia/runs/<run_id>/context.md` (the `.gaia/` rule in `.gitignore`
-   keeps it out of any commit), and emit a JSON stdout payload
-   rewriting the marker in the prompt to inline instructions:
+   keeps it out of any commit), and emit `additionalContext` pointing
+   Claude at the file:
    ```json
    {
      "hookSpecificOutput": {
        "hookEventName": "UserPromptSubmit",
-       "updatedPrompt": "<prompt with marker replaced by `Read .gaia/runs/<run_id>/context.md before acting.`>"
+       "additionalContext": "The user prompt references .gaia/runs/<run_id>/context.md. Read that file before acting — it holds the task content that did not fit inline."
      }
    }
    ```
+   Claude Code injects `additionalContext` as a system reminder
+   alongside the original prompt. No prompt rewriting is attempted
+   (`updatedPrompt` is not in the documented `UserPromptSubmit`
+   output surface); the `--- CONTEXT FILE ---` marker remains visible
+   in the prompt as a human-readable crumb.
 8. Exit 0.
 
 Any git error aborts the hook with non-zero exit, blocking prompt
@@ -701,9 +800,14 @@ depends on undocumented JSONL schema.
 
 1. Look up `/tmp/gaia/<session_id>.json`. If absent, exit 0 (non-gaia
    session).
-2. Read `gaia.workBranch` / `gaia.stateBranch` from git config. If
-   either is missing, abort with a non-zero exit — the session was not
-   properly initialized.
+2. Read `work_branch`, `state_branch`, `run_id`, and
+   `experimental_mode` directly from the JSON loaded in step 1. The
+   session-scoped tmp file is the **authoritative** source for these
+   values — it was written by the `UserPromptSubmit` hook in the same
+   session and is not shared with any other process. `git config
+   gaia.*` values (written in §8.1 step 4) are convenience for
+   Claude's own Bash tool reads and may be stale or overwritten by
+   the agent; the Stop hook does not rely on them.
 3. **Final commit sweep (conditional) then push (unconditional).**
    ```bash
    if [ -n "$(git status --porcelain)" ]; then
@@ -821,6 +925,53 @@ the agent had to call explicitly. Hooks are strictly better:
 - Sessions can run any prompt, including prompts authored without
   knowing gaia exists.
 
+### 8.6 Hook coexistence policy
+
+`UserPromptSubmit`, `Stop`, and `StopFailure` are the three events
+gaia registers handlers for. In current Claude Code, none of them
+accept matchers, all registered handlers fire in parallel, and when
+multiple handlers return decision objects the most restrictive
+decision wins. That parallelism makes safe coexistence with another
+project-level hook on the same event impossible — a sibling hook
+could block gaia's session-start, return a conflicting `decision` on
+`Stop`, or race gaia's worktree mutations.
+
+**v1 policy: gaia owns the three events, exclusively, per repo.**
+
+- `gaia init` reads the existing `.claude/settings.json` (if any) and
+  scans for pre-existing handlers on `UserPromptSubmit`, `Stop`, or
+  `StopFailure`. If it finds any handler it did not write itself (see
+  detection below), it aborts before modifying any file. The printed
+  error:
+  - Names the conflicting event(s) and the first handler's `command`.
+  - Offers three remediations: (1) remove the pre-existing handler;
+    (2) inline whatever it does into the gaia shim yourself and rerun
+    `gaia init --force-merge-hooks` (flag reserved for v1.x, not
+    implemented in v1 — the message spells that out); (3) do not
+    install gaia in this repo.
+  - Exits non-zero.
+- A handler is recognized as gaia's own if its `command` references
+  `.claude/hooks/gaia-user-prompt-submit.js` or
+  `.claude/hooks/gaia-stop.js` (with or without the `$CLAUDE_PROJECT_DIR`
+  prefix). `gaia init` treats these as safe to replace on rerun.
+- On repos that have never registered any of the three events,
+  `gaia init` writes the block described in §8 wholesale.
+- `gaia doctor` re-runs the same scan on every invocation and warns
+  if a foreign handler appears on any of the three events
+  post-install (e.g., another tool added one later); the run does not
+  fail, but the warning surfaces the risk.
+
+**What this does not block.** `PreToolUse`, `PostToolUse`,
+`SubagentStop`, `Notification`, and any other event outside the three
+gaia owns are unaffected. Repos can freely use those alongside gaia.
+
+**When this policy will relax.** Composition is the right long-term
+answer — a single shim dispatcher that chains to pre-existing
+handlers when the session is not a gaia session, and runs gaia logic
+otherwise. That design is deferred to v1.x (§14) because it is
+non-breaking: today's refusal becomes tomorrow's success, and the
+installed settings layout does not need to change to accommodate it.
+
 ## 9. Saved routine prompt
 
 Static. Emitted by `gaia init` for the user to paste once into the
@@ -927,7 +1078,7 @@ offers to rebuild `history.jsonl` from the runs directory.
   "run_id": "01HXX...",
   "session_id": "session_01HJK...",
   "session_url": "https://claude.ai/code/sessions/session_01HJK...",
-  "status": "pending" | "success" | "failed" | "timeout" | "push-rejected" | "conflict",
+  "status": "pending" | "success" | "no-merge" | "failed" | "timeout" | "push-rejected" | "conflict",
   "user_branch": "feature/auth",
   "work_branch": "claude/gaia/01HXX.../work",
   "state_branch": "claude/gaia/01HXX.../state",
@@ -958,10 +1109,11 @@ offers to rebuild `history.jsonl` from the runs directory.
 }
 ```
 
-`status` takes the same set as `meta.json`. Failed, timed-out, and
-push-rejected runs are first-class entries — visible to `gaia
-history` and actionable by `gaia recover` — so the recovery story does
-not leak through the UX.
+`status` takes the same set as `meta.json`. Failed, timed-out,
+push-rejected, and no-merge runs are first-class entries — visible to
+`gaia history` and actionable by `gaia recover` — so the recovery
+story does not leak through the UX. (No-merge is an intentional
+caller request, not a failure; §6.1.2.)
 
 **Concurrency.** Multiple parallel `gaia` processes may append to
 `history.jsonl`. gaia uses a file lock (`.gaia/history.lock` via
@@ -1053,6 +1205,8 @@ branch is disposable at that point.
 Exceptions (branches preserved on origin):
 
 - `--keep-branches`.
+- `--no-merge` — branches are kept because the caller explicitly
+  deferred the merge; `gaia recover` will complete it later.
 - Any non-zero exit (3, 4, 13, 15) — `gaia recover` needs the
   branches to exist.
 
@@ -1155,6 +1309,18 @@ policy rather than by convention.
   decision semantics are confirmed stable across Claude Code versions,
   the flag drops the lab-quality warning and/or the mode becomes the
   default transport for `-c` / `--resume`.
+- **Composing with pre-existing hooks.** v1 refuses to install if the
+  repo already defines `UserPromptSubmit`, `Stop`, or `StopFailure`
+  handlers (§8.6). v1.x can lift this by making the gaia shim a
+  dispatcher: for non-gaia sessions, exec the pre-existing handler;
+  for gaia sessions, run gaia logic. The installed settings layout
+  does not change, so the transition is non-breaking. Reserved flag:
+  `gaia init --force-merge-hooks`.
+- **Shell-only shim install.** Current shims are Node (§8.0) for
+  cross-platform teammate support. Repos that want to minimize
+  dependencies on the cloud VM or on teammates' machines could opt
+  into POSIX `.sh` shims with equivalent behavior. Tracked as a
+  v1.x opt-in; not the default.
 
 ## 15. Lab-quality mode: `--experimental-mode`
 
@@ -1196,39 +1362,59 @@ Flow:
 
 1. Driver fires the routine with a `GAIA_EXPERIMENTAL_MODE: 1` header
    in the payload. Drops the state-branch poll interval to 2s for
-   this run. The `UserPromptSubmit` hook persists
-   `gaia.experimentalMode = 1` to git config so the Stop hook sees it
-   regardless of transcript state.
+   this run. The `UserPromptSubmit` hook records
+   `experimental_mode: "1"` in `/tmp/gaia/<session_id>.json` (§8.1
+   step 4) — that tmp file is where the Stop hook reads it. Git
+   config (§8.1 step 5) also gets a copy for Claude's own Bash tool
+   reads, but it is not load-bearing for hook logic.
 2. VM: Claude processes the initial task, produces a response
    (possibly ending in a question). `Stop` hook fires.
-3. Hook first checks `stop_hook_active` from stdin. If `true`, the
-   hook itself caused the previous block — short-circuit to exit 0 to
-   prevent infinite continuation. Otherwise, detect experimental mode
-   from git config. Instead of the standard `GAIA_DONE:` sentinel,
-   push:
-   ```
-   GAIA_PENDING: <session_id> #<turn_n>
+3. Hook reads `experimental_mode` from the session's
+   `/tmp/gaia/<session_id>.json` (loaded in §8.2 step 1). If it is not
+   `"1"`, fall through to the standard `Stop`-hook path (§8.2).
+   Otherwise, compute the current turn state by reading the state
+   branch: let `P` be the highest turn number across `GAIA_PENDING:`
+   commits (0 if none) and `I` the highest across `GAIA_INPUT:`
+   commits (0 if none).
+   - If `P == I`, this is a fresh turn. The new turn number is
+     `T = P + 1`. Proceed to step 4.
+   - If `P > I`, a prior pending turn was never answered — the
+     previous hook invocation must have been killed or crashed before
+     finalizing. Run the fallback-finalize path (§15.3 row 1: write
+     the standard `GAIA_DONE:` artifacts with whatever transcript
+     exists) and exit 0 — do not push another `GAIA_PENDING`.
 
-   A  .gaia-state/<session_id>/pending_<turn_n>.md    (Claude's latest response)
+   The `stop_hook_active` field on stdin is an informational hint that
+   this is not the first `Stop` of the session; it is **not** used as
+   the guard. Earlier drafts short-circuited on `stop_hook_active ===
+   true`, which ended every multi-turn session after the first block
+   (every `Stop` after the first has the field `true` by design). The
+   `P` vs `I` comparison sustains arbitrarily many turns while still
+   catching genuine re-entry bugs.
+4. Instead of the standard `GAIA_DONE:` sentinel, push:
    ```
-4. Hook starts polling (2s) `origin/<state_branch>` for a matching
-   `GAIA_INPUT: <session_id> #<turn_n>` commit. Blocking-wait up to
+   GAIA_PENDING: <session_id> #<T>
+
+   A  .gaia-state/<session_id>/pending_<T>.md    (Claude's latest response)
+   ```
+5. Hook starts polling (2s) `origin/<state_branch>` for a matching
+   `GAIA_INPUT: <session_id> #<T>` commit. Blocking-wait up to
    9 minutes (safely under the configured 10-min hook timeout in §8).
-5. Driver sees `GAIA_PENDING:`. Reads `pending_<turn_n>.md`. Prints
+6. Driver sees `GAIA_PENDING:`. Reads `pending_<T>.md`. Prints
    Claude's response to stdout. Prompts the user:
    ```
    reply (ctrl-D to finish):
    ```
-6. User types a reply on stdin (supports multi-line; ends on EOF).
-7. Driver writes `.gaia-state/<session_id>/input_<turn_n>.md` with
-   the reply and pushes `GAIA_INPUT: <session_id> #<turn_n>` to the
+7. User types a reply on stdin (supports multi-line; ends on EOF).
+8. Driver writes `.gaia-state/<session_id>/input_<T>.md` with
+   the reply and pushes `GAIA_INPUT: <session_id> #<T>` to the
    state branch. The input-file body is one of:
    - `GAIA_CONTINUE` — driver auto-continue (§15.5 heuristic).
    - `__GAIA_END__` — user ended the session with EOF after accepting
      Claude's response.
    - `__GAIA_ABORT__` — user typed `:abort` at the reply prompt.
    - Otherwise: the user's literal reply text.
-8. Hook sees the input commit and branches on the body:
+9. Hook sees the input commit and branches on the body:
    - **Regular reply:** return the Stop-hook decision JSON
      ```json
      {
@@ -1237,7 +1423,7 @@ Flow:
      }
      ```
      Claude resumes with the reply as a system-reminder user turn.
-     Loop to step 2 for turn `n+1`.
+     Loop to step 2 for turn `T+1`.
    - **`GAIA_CONTINUE`:** return
      ```json
      {
@@ -1245,7 +1431,7 @@ Flow:
        "reason": "No user reply was provided. Continue the task autonomously."
      }
      ```
-     Loop to step 2 for turn `n+1`.
+     Loop to step 2 for turn `T+1`.
    - **`__GAIA_END__` or `__GAIA_ABORT__`:** **the same hook
      invocation** performs the final sweep, writes the standard
      success artifacts, and pushes `GAIA_DONE: <session_id>` — *then*
@@ -1306,11 +1492,16 @@ In every fallback case:
   safety margin before Claude Code kills it. The per-handler
   `timeout` is configurable but has no documented upper bound; raising
   it risks hitting the (also undocumented) VM wall-clock cap.
-- **Infinite-continuation guard.** The `stop_hook_active` check (§15.2
-  step 3) is the only thing preventing a block → unblock → Stop →
-  block loop. gaia short-circuits on `stop_hook_active === true` even
-  when an input commit looks valid. An edge case where the driver
-  dies between pending turns is covered by the fallback timeout.
+- **Re-entry guard.** §15.2 step 3 compares the highest `GAIA_PENDING`
+  and `GAIA_INPUT` turn numbers on the state branch (`P` vs `I`) to
+  decide whether the current `Stop` is a fresh turn or a re-entry. A
+  fresh turn has `P == I`; re-entry without a matching input
+  (`P > I`) triggers fallback-finalize instead of pushing another
+  `GAIA_PENDING`. `stop_hook_active` is **not** the guard: every
+  `Stop` after the first has it `true` by design, so using it as the
+  short-circuit would terminate every multi-turn session after
+  turn 1. The driver dying between pending turns is covered by the
+  9-minute hook blocking-wait falling back to `GAIA_DONE:`.
 - **VM wall-clock ceiling unknown.** Anthropic's docs state idle
   compute is not billed but do not specify a max session lifetime.
   `gaia doctor` should measure this empirically before users rely on
