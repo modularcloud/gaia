@@ -91,6 +91,20 @@ CLI-shape stability promise.
   so a project can add other `PreToolUse` handlers on disjoint
   matchers without conflict.
 - **No local Claude invocation.** v1 always goes through a cloud routine.
+- **No MCP / connector tools in gaia routines.** Claude Code
+  surfaces MCP server tools as regular tools in tool events
+  (named `mcp__server__tool`), and a GitHub / filesystem / shell
+  MCP could mutate the repo or protocol state outside gaia's
+  protected-path set. gaia v1 does not model the write surface
+  of arbitrary MCP servers, so the routine attached to a gaia
+  run must have no connectors and no write-capable MCP tools
+  registered. `gaia init` surfaces this as a prerequisite (§5)
+  and `gaia doctor` probes for it end-to-end (§8.4). The
+  `PreToolUse` shim denies every `mcp__.*` call in a gaia
+  session as a runtime safety net (§8.5). Modeling MCP
+  connectors safely is tracked in §14; a future release may
+  introduce an allow-list once the common connectors' write
+  surfaces are characterized.
 
 ## 3. Architecture
 
@@ -130,10 +144,25 @@ hook handlers — no custom CLI surface the agent has to remember.
 `gaia-hook-*` binaries directly. Instead, `gaia init` commits small
 shim scripts under `.claude/hooks/` that peek at hook stdin, no-op
 silently when the session is not a gaia session, and delegate to the
-global binary only when it is. This keeps the settings file safe on a
-teammate's machine that does not have gaia installed (the shim is
-always present in the repo clone; the global binary is only required
-for gaia sessions). See §8 for the full shim / hook layout.
+global binary only when it is. When Node is on `PATH`, a teammate
+without the global gaia binary can open Claude Code in the repo
+and their non-gaia prompts run unaffected — the shim classifies
+the session, exits 0 silently, and Claude Code proceeds as normal.
+The *global binary* is only required for *gaia sessions*.
+
+**Node is still a prerequisite for any Claude Code session that
+opens this repo.** The shim command string in
+`.claude/settings.json` starts with `node` (§8), so if Node is
+not on `PATH`, the hook fails to start regardless of whether the
+session is gaia — Claude Code reports a hook-start error and the
+session is disrupted. The "non-gaia sessions run unaffected"
+property above assumes Node is available; it is not an
+unconditional promise. §5 documents Node 20+ as a hard
+prerequisite for any environment opening Claude Code in a
+gaia-initialized repo, and `gaia init` prints a banner so the
+repo owner can communicate this to teammates. Future work (§14)
+tracks a POSIX `.sh` opt-in for repos that want to drop the
+Node prerequisite. See §8 for the full shim / hook layout.
 
 ## 4. Terminology
 
@@ -198,8 +227,18 @@ the web enabled. ZDR orgs are blocked.
      ```
      This script is cached after first run (Claude Code environment
      caching).
+   - **No MCP servers configured.** gaia v1 bans MCP / connector
+     tools in routines (§2). The cloud environment attached to
+     the gaia routine must not have any MCP server entries in
+     its configuration. `gaia init` prints the exact place to
+     check in the Claude Code environment UI; `gaia doctor` runs
+     a cloud-session probe (§8.4) that fails if any `mcp__*`
+     tool is visible to a gaia session.
 2. A Claude Code routine attached to that environment, with the saved
-   prompt from §9 and an API trigger.
+   prompt from §9 and an API trigger, and **no connectors
+   attached**. Routines attached to a gaia run must be
+   connector-free for the same reason as the environment bullet
+   above.
 3. `GAIA_ROUTINE_URL` and `GAIA_ROUTINE_TOKEN` stored locally via
    `gaia config set`.
 4. `.claude/settings.json` and `.claude/hooks/*.js` committed to the
@@ -212,8 +251,11 @@ the web enabled. ZDR orgs are blocked.
    the remediation path in §8.7. Pre-existing `PreToolUse` handlers
    are tolerated when their matchers are disjoint from gaia's
    protected-file matcher set (§8.5).
-5. `.gitignore` entry for `.gaia/` (local state only). `gaia init`
-   appends this.
+5. `.gitignore` entries for `.gaia/` (driver-local state) and
+   `.gaia-context/` (VM-side overflow-context staging per §7.2).
+   `gaia init` appends both, and warns if `.env` is present at the
+   repo root but not already matched by the resulting ignore set
+   — gaia does not own `.env`'s ignore status (§10.2).
 6. Claude Code cloud repository access configured for the repo, with
    push permission on the `claude/gaia/*` namespace. In practice today
    this means either the Claude GitHub App is installed (the path the
@@ -261,21 +303,29 @@ commit on the work branch before firing (§6.1 step 2, §8.8).
   so the work / state branches have somewhere to go regardless of
   whether the user branch itself tracks anything.
 
-**Managed policy.** Enterprise Claude Code installs can neutralize
-project-level hooks two ways: `disableAllHooks: true` in any
-effective settings layer disables every hook regardless of
-provenance; `allowManagedHooksOnly: true` in the managed
+**Managed policy.** Enterprise Claude Code installs can
+neutralize project-level hooks two ways: `disableAllHooks: true`
+in any effective settings layer disables every hook regardless
+of provenance; `allowManagedHooksOnly: true` in the managed
 settings layer restricts hooks to those installed at the managed
 layer, blocking user, project, and non-force-enabled plugin
 handlers. Either setting makes gaia's project-committed shims
-inert on that machine. `gaia init` and `gaia doctor` both probe
-whether project-level hooks are honored on this machine (§8.4
-step 1) by registering a trivial test hook and confirming it
-fires; if `disableAllHooks` is live, `allowManagedHooksOnly` is
-live and managed settings do not whitelist gaia's shims, or a
-similar future policy neutralizes hooks, gaia is unusable in
+inert on that machine. `gaia doctor --cloud` (§8.4) probes this
+on the *cloud VM* by firing a synthetic session against the
+configured repo and confirming a beacon-echo hook fires; that
+path catches managed policy attached to the Claude Code
+environment, which is where routines actually execute. `gaia
+doctor --local` probes the *driver machine's* Claude Code
+install (if one is present) by registering a scratch test
+hook — this covers the case where a teammate opens the repo in
+`claude` locally. If either probe fails, gaia is unusable in
 that environment until the policy is relaxed. This is a hard
-prerequisite, surfaced loudly rather than silently degraded.
+prerequisite, surfaced loudly rather than silently degraded. A
+driver machine without `claude` installed is common (§1's
+"caller needs no local Claude install" promise), and in that
+case `gaia doctor --local` exits 0 with a note that the local
+surface was not exercised — `gaia doctor --cloud` is the
+mandatory gate.
 
 ## 6. Usage
 
@@ -293,7 +343,18 @@ command shapes aligned with Claude Code's own syntax).
 Flow:
 
 1. Generate `GAIA_RUN_ID` (ULID) and `GAIA_NONCE` (24 random bytes,
-   base64).
+   base64). Read the user branch's upstream configuration once
+   and cache it for the run:
+   `upstream_remote = git config branch.<user_branch>.remote`,
+   `upstream_ref = git config branch.<user_branch>.merge`,
+   `upstream_branch = <upstream_ref stripped of refs/heads/>`,
+   `local_only_branch = (upstream_remote is empty)`. These four
+   values are written into both the §7.4 manifest (before
+   firing) and `meta.json` (§10.3), and every push at
+   merge-back time (§6.1.1) or during `gaia recover` (§6.4)
+   reads them from there rather than re-querying git config,
+   so a long-running session cannot drift away from the user's
+   intended upstream.
 2. Build and push the run branches:
    - Seed a local `claude/gaia/$RUN_ID/work` from the user branch.
    - **Enforce the work-branch hook invariant** (§8.8): reconcile the
@@ -338,32 +399,37 @@ Flow:
      `"fire-failed"` event to `history.jsonl`, delete the freshly-
      pushed work / state branches from origin (no session ever
      ran, so no recovery is possible), and exit 5.
-   - **HTTP error envelope received** — a named error response
-     per §11.2's table (401/403/404/429/500/503/400). The
-     response body proves the server handled the request
-     without creating a session, so retrying is safe for the
-     rows marked retryable (429/500/503). After the documented
-     retry policy exhausts or the row is non-retryable,
-     transition `meta.status = "fire-failed"`, append the
-     `"fire-failed"` event, delete the work/state branches, and
-     exit per the §11.2 mapping (10/11/12).
-   - **Ambiguous** — request body may have been sent and a
-     session may exist, but the driver received no parseable
-     response to prove it. Examples: TLS error after the first
-     bytes of the request body were written, connection reset
-     mid-body or mid-response, timeout reading the response
-     headers, or a 2xx envelope whose body failed to parse a
-     `claude_code_session_id`. The driver does **not** retry the
-     same `GAIA_RUN_ID` in this case. Instead it transitions
-     `meta.status = "fire-ambiguous"` (§10.3), leaves
-     `session_id` / `session_url` as `null`, **preserves** the
-     work and state branches on origin (a session may be about
-     to push to them), and exits 16 with a message pointing at
-     `gaia recover <run_id>` (§6.4). `gaia recover` polls the
-     state branch for any valid terminal sentinel — the sentinel
+   - **Side-effect-free HTTP error envelope received** — a
+     named error response from the documented side-effect-free
+     set (400/401/403/404/429). These responses semantically
+     mean "request rejected before work started," so retrying
+     is safe for the rows marked retryable (429 only). After
+     the documented retry policy exhausts or the row is non-
+     retryable, transition `meta.status = "fire-failed"`,
+     append the `"fire-failed"` event, delete the work/state
+     branches, and exit per the §11.2 mapping (10/11/12).
+   - **Ambiguous** — either a 5xx HTTP envelope (`api_error`,
+     `overloaded_error`) whose side-effect semantics Anthropic
+     does not document, or a network failure after request-body
+     bytes may have reached the socket. The driver cannot prove
+     a session was not created: a 5xx could have come back
+     after the server had already begun session creation, and a
+     mid-body TLS error leaves the request in an unknown state.
+     The driver does **not** retry the same `GAIA_RUN_ID` in
+     this case. Instead it transitions `meta.status =
+     "fire-ambiguous"` (§10.3), leaves `session_id` /
+     `session_url` as `null`, **preserves** the work and state
+     branches on origin (a session may be about to push to
+     them), and exits 16 with a message pointing at `gaia
+     recover <run_id>` (§6.4). `gaia recover` polls the state
+     branch for any valid terminal sentinel — the sentinel
      commit message carries the session_id, so a late arrival
      promotes the run to `success` / `failed` / `aborted`
-     without the driver ever needing a `/fire` response.
+     without the driver ever needing a `/fire` response. If no
+     sentinel arrives, recovery offers to classify the run as
+     `fire-failed` (with explicit confirmation) or to retry
+     with a fresh `GAIA_RUN_ID` while preserving the ambiguous
+     run's branches for audit.
    On a clean 2xx, the spawner returns `claude_code_session_id`
    and `claude_code_session_url`. Update `meta.json` with both and
    proceed to step 6.
@@ -402,7 +468,27 @@ Flow:
 
 After a `GAIA_DONE:` sentinel, the driver performs the merge as a
 strict sequence and never force-pushes. Each step's failure surfaces
-as a distinct, actionable exit code:
+as a distinct, actionable exit code.
+
+**Local merge lock (v1).** Two gaia processes operating in the
+same physical checkout cannot run this sequence concurrently —
+they both want to mutate `HEAD` and the index. Before starting
+step 1 below, the driver acquires an exclusive advisory lock on
+`.gaia/merge.lock` via `flock` (POSIX) or `LockFileEx`
+(Windows, when the platform ships). If the lock is held, the
+driver waits up to 30 s then fails with exit 2 naming the
+run_id that holds the lock. The lock is held through step 7
+and released in a `finally` handler so a crashed driver
+cannot strand it (POSIX advisory locks release on process
+exit). `gaia recover --merge` takes the same lock — a run
+recovering into a merge-back serializes against any
+concurrent in-flight merge-back in the same checkout.
+
+Concurrent runs in *different* checkouts (the common case
+when teammates each have their own clone) do not share
+`.gaia/merge.lock`, so they never block each other. The lock
+is per-working-tree, which is the level at which `git
+checkout` / `git merge` conflict.
 
 1. Verify HEAD is still the caller's original user branch. If the user
    switched branches mid-run, `git checkout` it back and re-verify the
@@ -410,15 +496,18 @@ as a distinct, actionable exit code:
 2. If the working tree is dirty, abort with exit 2 — gaia will not
    overwrite manual edits. Run id and work branch are printed to
    stderr.
-3. If the user branch tracks an upstream, run
+3. If `meta.local_only_branch == false`, run
    ```
-   git fetch <upstream-remote> \
-     "+refs/heads/<upstream-branch>:refs/remotes/<upstream-remote>/<upstream-branch>"
+   git fetch $UPSTREAM_REMOTE \
+     "+$UPSTREAM_REF:refs/remotes/$UPSTREAM_REMOTE/$UPSTREAM_BRANCH"
    ```
-   to pick up any upstream advance. Local-only user branches skip
-   this step (§5).
-4. If the user branch tracks upstream, fast-forward local to
-   `<upstream-remote>/<upstream-branch>`. If fast-forward is
+   using `upstream_remote`, `upstream_branch`, and `upstream_ref`
+   from `meta.json` (§10.3). This picks up any upstream advance
+   regardless of remote name, branch-rename, or fork
+   configuration. Local-only user branches skip this step (§5,
+   `meta.local_only_branch == true`).
+4. If the user branch tracks an upstream, fast-forward local to
+   `$UPSTREAM_REMOTE/$UPSTREAM_BRANCH`. If fast-forward is
    impossible (the user committed locally during the run), exit 2
    with a recovery message.
 5. Fetch the work branch with an explicit refspec and merge it:
@@ -428,9 +517,11 @@ as a distinct, actionable exit code:
    git merge --no-ff "refs/remotes/origin/$GAIA_WORK_BRANCH"
    ```
    Conflict → `git merge --abort`, exit 4; work branch preserved on
-   origin.
-6. If the user branch tracks upstream,
-   `git push <upstream-remote> "<user-branch>:<upstream-branch>"`.
+   origin. The work branch always lives on `origin` (the Claude
+   GitHub proxy pushes there); the upstream for the user branch
+   can be a different remote entirely (`upstream_remote` above).
+6. If `meta.local_only_branch == false`,
+   `git push $UPSTREAM_REMOTE "$USER_BRANCH:$UPSTREAM_BRANCH"`.
    Never force. Rejection → exit 15 (merge local, push upstream) with
    instructions: investigate the upstream advance, then `git push`
    manually when safe **or run `gaia recover <run_id>`** (which
@@ -440,7 +531,7 @@ as a distinct, actionable exit code:
    on the local branch only and `meta.json` records
    `pushed_upstream: false` for clarity.
 7. On full success, delete the remote work / state branches and
-   finalize history.
+   finalize history. Release the merge lock.
 
 Explicit refspecs are used throughout because gaia branches are
 slash-heavy (`claude/gaia/<ulid>/work`) and ambiguous fetch / checkout
@@ -448,6 +539,17 @@ arguments can resolve to either a tag or a remote-tracking ref
 depending on local refs. The `+refs/heads/...:refs/remotes/...` form
 fetches exactly the named branch into the corresponding tracking ref
 and nothing else.
+
+**Why `meta.upstream_*` and not a fresh `git config` lookup.**
+Reading `branch.<name>.remote` / `branch.<name>.merge` at
+merge-back time works for the common case but misses two edge
+cases: (1) a long-running session where the user deliberately
+retargets the branch to a different remote or renames the
+upstream; (2) `gaia recover` running hours later after the
+user's local git config has drifted. Pinning the upstream at
+fire time and replaying it at merge-back time keeps the push
+target consistent with what the user meant when they
+invoked `gaia`.
 
 #### 6.1.2 `--no-merge`
 
@@ -491,7 +593,7 @@ Exit codes:
 | 5 | Definite-not-sent network failure after retries (DNS / TCP connect / TLS handshake; §11.2). `meta.status = "fire-failed"`. |
 | 10 | Spawner returned 401/403 (entitlement / token). `meta.status = "fire-failed"`. |
 | 11 | Spawner returned 429 after retries exhausted. `meta.status = "fire-failed"`. |
-| 12 | Non-auth, non-rate-limit spawner failure after retries — 400 invalid request, 404 routine not found, 500 `api_error`, or 503 `overloaded_error` after backoff (§11.2). `meta.status = "fire-failed"`. |
+| 12 | Non-auth, non-rate-limit side-effect-free spawner failure — 400 invalid request, 404 routine not found (§11.2). `meta.status = "fire-failed"`. 5xx responses are ambiguous rather than fire-failed and surface as exit 16. |
 | 13 | `GAIA_FAILED:` sentinel received (session aborted by routine / API error; details printed to stderr). |
 | 15 | Merge succeeded locally but push to `origin/<user-branch>` was rejected. Local user branch has the merge commit; `git push` when ready. |
 | 16 | Ambiguous `/fire` failure — driver could not prove either outcome (§6.1 step 5, §11.2). `meta.status = "fire-ambiguous"`. Work/state branches preserved for `gaia recover <run_id>` to poll for a late sentinel. |
@@ -629,7 +731,7 @@ gaia history                                   # list recent runs: run_id, sessi
 gaia history show <session_id>                 # print the transcript for a prior session
 gaia recover <run_id|session_id> [--merge]     # finish a stuck run: fetch preserved state/work, surface the sentinel (if any), offer merge or manual review. --merge opts aborted runs into a merge-back.
 gaia gc [--max-age 14d] [--dry-run]            # sweep stale claude/gaia/* branches on origin
-gaia doctor                                    # run a synthetic end-to-end session to validate spawner, hooks, transcript schema, branch permissions
+gaia doctor [--cloud|--local|--full]           # validate transport. Default --cloud fires a synthetic session and checks spawner, hooks, transcript schema, branch permissions, MCP-free routine, VM managed policy. --local requires a local `claude` and checks driver-machine hook honoring and the Node shim. --full runs both.
 gaia version
 ```
 
@@ -639,23 +741,39 @@ gaia version
 3. Writes `.claude/settings.json` and `.claude/hooks/*.js` to the repo
    root (§8). If `.claude/settings.json` exists **but does not already
    define project-level `UserPromptSubmit`, `Stop`, or `StopFailure`
-   handlers**, merges the remaining `hooks` key non-destructively. If
-   it does define any of those three events, `gaia init` aborts with
-   the error documented in §8.7 (hook coexistence) and offers
-   migration guidance. Notes that managed-policy or plugin-scope
-   handlers for the same events are outside `gaia init`'s visibility
-   (§8.7) and, if present, will still run alongside gaia's.
-4. Appends `.gaia/` to `.gitignore`.
+   handlers**, merges the gaia-managed subset (§8.8) — the four hook
+   entries plus the `permissions.deny` entries — non-destructively,
+   preserving foreign entries on the same top-level keys. If it
+   does define any of those three exclusive events, `gaia init`
+   aborts with the error documented in §8.7 (hook coexistence)
+   and offers migration guidance. Notes that managed-policy or
+   plugin-scope handlers for the same events are outside `gaia
+   init`'s visibility (§8.7) and, if present, will still run
+   alongside gaia's.
+4. Appends `.gaia/` and `.gaia-context/` to `.gitignore` (each
+   only if not already present). Also verifies that if `.env`
+   exists at the repo root, a matching ignore rule is already in
+   effect — warns and points at remediation if not (§10.4).
 5. Prints the saved routine prompt (§9) for the user to paste into the
    Claude Code routines UI.
 6. Prints the one-line VM setup-script snippet.
 7. Prints the Node-prerequisite banner (§5) so the repo owner can
    communicate to teammates that opening Claude Code in this repo
    requires Node 20+ on `PATH`.
-8. Verifies the hook files exist on the default branch. If they do
+8. Prints the **MCP-free prerequisite banner** (§2, §5): the
+   Claude Code environment attached to the gaia routine must
+   not have any MCP servers configured, and the routine must
+   not have connectors attached. gaia cannot check this via
+   the public API, so the banner names the exact UI surface to
+   inspect. `gaia doctor --cloud` verifies the prerequisite
+   end-to-end (§8.4).
+9. Verifies the hook files exist on the default branch. If they do
    not, offers to open a PR (via `gh`) or prints the git commands.
    Does not claim success until this step passes.
-9. Offers to run `gaia doctor` before exit.
+10. Offers to run `gaia doctor --cloud` before exit (the
+    required tier; §8.4). `--full` can be requested at the
+    prompt to add local-tier checks when a local `claude` is
+    available.
 
 There is no separate `gaia vm-install` step in this design. The hooks
 travel with the repo; the VM setup script's only job is to install
@@ -684,16 +802,27 @@ invocation's process to still be alive:
     merge landed): the local user branch should already contain the
     recorded `merge_sha`. `gaia recover` verifies this with
     `git merge-base --is-ancestor <merge_sha> <user_branch>`. If
-    true, it fetches `origin/<user_branch>` and retries
-    `git push origin <user_branch>` without re-merging. If the
-    upstream has advanced such that fast-forward is no longer
-    possible, `gaia recover` stops and instructs the user to
-    rebase/merge manually, printing both `merge_sha` and the
-    current upstream tip. If the local branch no longer contains
-    `merge_sha` (e.g., the user reset locally), `gaia recover`
-    refuses and prints the work-branch name so the caller can
-    decide whether to re-merge from scratch or abandon. Never
-    force-pushes.
+    true, it fetches
+    `$UPSTREAM_REMOTE/$UPSTREAM_BRANCH` using the
+    `upstream_remote` / `upstream_branch` recorded in
+    `meta.json` (not a hardcoded `origin`) and retries
+    `git push $UPSTREAM_REMOTE "$USER_BRANCH:$UPSTREAM_BRANCH"`
+    without re-merging. This preserves upstream configurations
+    where the user branch tracks a fork, a non-`origin` remote,
+    or a renamed upstream branch. If the upstream has advanced
+    such that fast-forward is no longer possible, `gaia recover`
+    stops and instructs the user to rebase/merge manually,
+    printing both `merge_sha` and the current upstream tip. If
+    the local branch no longer contains `merge_sha` (e.g., the
+    user reset locally), `gaia recover` refuses and prints the
+    work-branch name so the caller can decide whether to
+    re-merge from scratch or abandon. Never force-pushes.
+    Acquires `.gaia/merge.lock` for the retry (§6.1.1) so a
+    recover retry does not race an in-flight run in the same
+    checkout. Local-only runs (`meta.local_only_branch: true`)
+    have no push to retry; `gaia recover` reports success
+    immediately since the merge already landed locally at run
+    end.
   - **`"no-merge"`**, **`"timeout"`**, **`"conflict"`**: fetches
     the preserved `claude/gaia/$RUN_ID/{work,state}` branches. If
     a `GAIA_DONE:` sentinel exists and validates (§6.1 step 6),
@@ -716,29 +845,46 @@ invocation's process to still be alive:
     prints the recorded error body and exits 0. Listed for
     completeness so `gaia history` entries with this status are not
     silently ignored.
-  - **`"fire-ambiguous"`** (§6.1 step 5): the driver could not tell
-    whether `/fire` created a session. `session_id` is `null`, the
-    work and state branches are preserved on origin. `gaia recover`
-    fetches the state branch with an explicit refspec and polls it
-    for any `GAIA_DONE: <session_id>` / `GAIA_FAILED: <session_id>` /
-    `GAIA_ABORTED: <session_id>` commit (bounded, default ~5 min
-    — override with `--wait <duration>`). If a sentinel arrives, the
-    session_id is extracted from the commit message, `meta.session_id`
-    and `meta.session_url` are set from whatever is captured in the
-    sentinel's artifacts (`.gaia-state/<session_id>.md` for success,
-    `.gaia-state/<session_id>.error.json` for failure), and the
-    run promotes to the corresponding terminal state (`"success"`
-    + merge-back, `"failed"`, or `"aborted"`) exactly as if the
-    sentinel had arrived during the original run's poll loop.
-    `session_url` is left `null` if the sentinel artifacts do not
-    record one — the URL is informational, not load-bearing. If
-    no sentinel arrives within the wait window, `gaia recover`
-    offers to mark the run as `"fire-failed"` and delete the
-    preserved branches (explicit user confirmation, or
-    `--assume-failed` for scripts); declining leaves the run in
-    `"fire-ambiguous"` for a later retry. Never auto-promotes
-    ambiguous runs to `"fire-failed"` without confirmation, since
-    a slow session may still push a late sentinel.
+  - **`"fire-ambiguous"`** (§6.1 step 5): the driver could not
+    tell whether `/fire` created a session. `session_id` is
+    `null`, the work and state branches are preserved on origin.
+    `gaia recover` fetches the state branch with an explicit
+    refspec and polls it for any `GAIA_DONE: <session_id>` /
+    `GAIA_FAILED: <session_id>` / `GAIA_ABORTED: <session_id>`
+    commit (bounded, default ~5 min — override with `--wait
+    <duration>`). If a sentinel arrives, `meta.session_id` is
+    extracted from the commit message and the run promotes to
+    the corresponding terminal state (`"success"` + merge-back,
+    `"failed"`, or `"aborted"`) exactly as if the sentinel had
+    arrived during the original run's poll loop.
+
+    `meta.session_url` **stays `null`** on fire-ambiguous
+    promotion: the sentinel artifacts
+    (`.gaia-state/<session_id>.md`,
+    `.gaia-state/<session_id>.transcript.md`,
+    `.gaia-state/<session_id>.error.json`) do not carry a
+    `session_url`, and gaia does not synthesize URLs from the
+    session_id because the endpoint's URL shape is opaque
+    (§10.3). A future release could have the Stop /
+    StopFailure hooks also push a
+    `.gaia-state/<session_id>.meta.json` artifact carrying
+    `{session_id, session_url, issued_at}` so recovery can
+    set `session_url` too; that artifact does not exist in v1
+    and `session_url: null` is the correct terminal state for
+    a fire-ambiguous run that resolves via late sentinel. The
+    URL is informational (for debugging in the Claude Code UI),
+    not load-bearing on recovery.
+
+    If no sentinel arrives within the wait window, `gaia
+    recover` offers to mark the run as `"fire-failed"` and
+    delete the preserved branches (explicit user confirmation,
+    or `--assume-failed` for scripts); declining leaves the
+    run in `"fire-ambiguous"` for a later retry. Never auto-
+    promotes ambiguous runs to `"fire-failed"` without
+    confirmation, since a slow session may still push a late
+    sentinel. The caller can alternatively start a fresh run
+    (new `GAIA_RUN_ID`) while leaving the ambiguous branches
+    preserved for later audit.
   - **`"pending"`** (driver crashed mid-run, no sentinel yet):
     prints the `session_url`, polls the state branch once for a
     late sentinel, and treats a subsequent `GAIA_DONE` /
@@ -847,17 +993,28 @@ branch *before* firing and replaces it in the payload with:
 
 ```
 --- CONTEXT FILE ---
-.gaia/runs/<run_id>/context.md
+.gaia-context/<run_id>/context.md
 --- END CONTEXT FILE ---
 ```
 
 The `UserPromptSubmit` hook (§8.1) detects this marker, fetches the
 state branch, and copies `.gaia-state/context.md` into the **work-tree**
-at `.gaia/runs/<run_id>/context.md` (gitignored, so the Stop hook's
-`git add -A` will not commit it). The hook then returns
+at `.gaia-context/<run_id>/context.md` (gitignored per §10.4, so the
+Stop hook's `git add -A` will not commit it). The hook then returns
 `hookSpecificOutput.additionalContext` pointing Claude at the file;
 Claude Code injects that string as a system reminder the model sees
 alongside the original prompt.
+
+**Why `.gaia-context/` and not `.gaia/runs/<run_id>/`.** An earlier
+draft placed the overflow file under `.gaia/runs/<run_id>/context.md`,
+which collides with the `Read(/.gaia/**)` deny rule in §8: the
+driver-local `.gaia/` tree holds secrets and transcripts and is
+fully read-denied as defense in depth, so a file that Claude must
+read cannot live under it. `.gaia-context/` is a distinct,
+VM-only namespace — gitignored (§10.4), write-denied (§8's
+`permissions.deny` + §8.5's protected-path set), and read-allowed.
+The shim writes to it (hooks are not tool calls, so permission
+rules do not apply); only tool-driven writes are blocked.
 
 Prompt-rewriting is deliberately not used. Current `UserPromptSubmit`
 hook output supports `additionalContext` and `sessionTitle` but does
@@ -937,10 +1094,48 @@ state branch:
   "state_branch": "claude/gaia/01HXX.../state",
   "base_sha": "<sha of user branch at fire time>",
   "user_branch": "feature/auth",
+  "upstream_remote": "origin",
+  "upstream_branch": "feature/auth",
+  "upstream_ref": "refs/heads/feature/auth",
+  "local_only_branch": false,
   "driver_version": "1.0.0",
-  "issued_at": "2026-04-21T10:30:00Z"
+  "issued_at": "2026-04-21T10:30:00Z",
+  "managed_file_hashes": {
+    ".claude/hooks/gaia-user-prompt-submit.js": "<sha256>",
+    ".claude/hooks/gaia-pre-tool-use.js": "<sha256>",
+    ".claude/hooks/gaia-stop.js": "<sha256>",
+    ".claude/settings.json": "<sha256>"
+  }
 }
 ```
+
+The `managed_file_hashes` map records the sha256 of each
+gaia-managed file as it appears on the work-branch tip
+*after* §8.8 synthesis (so it reflects the known-good state
+the session starts from). The Stop hook's integrity spot-
+check (§8.2 step 6) compares these hashes against the
+worktree at finalization time and refuses to push the work
+branch if any mismatch — protocol mutations cannot flow into
+the user branch through the merge-back that way. Hashes are
+a cheap defense against `PreToolUse` being bypassed; they
+are not cryptographic authentication of the session itself
+(§16.1 trust model still applies).
+
+The four upstream fields are captured from the caller's git
+configuration at fire time and reused by the merge-back
+(§6.1.1) and by `gaia recover` (§6.4) so every push targets
+the actual upstream the user branch tracks, not a hardcoded
+`origin`. `upstream_remote` and `upstream_branch` are pulled
+from `git config branch.<name>.remote` and
+`git config branch.<name>.merge` (stripping the
+`refs/heads/` prefix from the latter for display);
+`upstream_ref` is the full refspec as git recorded it. A
+user branch with no upstream (`local_only_branch: true`)
+sets all three upstream fields to the empty string and
+skips the push step at merge time (§5, §6.1.1). Recording
+them once on the manifest prevents drift across a long-
+running session where the user might change the branch's
+upstream mid-run.
 
 The `UserPromptSubmit` hook validates the manifest before doing any
 checkout or state change. This is the authoritative cross-check for
@@ -973,11 +1168,26 @@ Installed by `gaia init` under the repo root:
 {
   "permissions": {
     "deny": [
-      "Read(.gaia/**)",
-      "Write(.gaia/**)",
-      "Write(.claude/hooks/gaia-*.js)",
-      "Write(.claude/settings.json)",
-      "Write(.git/**)",
+      "Read(/.gaia/**)",
+      "Write(/.gaia/**)",
+      "Edit(/.gaia/**)",
+      "MultiEdit(/.gaia/**)",
+      "Write(/.gaia-state/**)",
+      "Edit(/.gaia-state/**)",
+      "MultiEdit(/.gaia-state/**)",
+      "NotebookEdit(/.gaia-state/**)",
+      "Write(/.gaia-context/**)",
+      "Edit(/.gaia-context/**)",
+      "MultiEdit(/.gaia-context/**)",
+      "Write(/.claude/hooks/gaia-*.js)",
+      "Edit(/.claude/hooks/gaia-*.js)",
+      "MultiEdit(/.claude/hooks/gaia-*.js)",
+      "Write(/.claude/settings.json)",
+      "Edit(/.claude/settings.json)",
+      "MultiEdit(/.claude/settings.json)",
+      "Write(/.git/**)",
+      "Edit(/.git/**)",
+      "MultiEdit(/.git/**)",
       "Bash(git checkout:*)",
       "Bash(git switch:*)",
       "Bash(git reset --hard:*)",
@@ -1000,7 +1210,7 @@ Installed by `gaia init` under the repo root:
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|Bash|NotebookEdit",
+        "matcher": "Edit|Write|MultiEdit|Bash|NotebookEdit|mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -1048,9 +1258,14 @@ protected-paths set and a handful of unambiguous Bash patterns
 every matching tool call because:
 - `permissions.deny` cannot distinguish gaia sessions from
   non-gaia sessions, so rules that depend on session identity
-  (e.g., "do not allow edits to the gaia-managed files *during a
-  gaia run*") have to be hook-gated to keep teammates' local
-  sessions unrestricted.
+  (e.g., denying MCP tool calls *only during a gaia run*) have
+  to be hook-gated to keep teammates' local sessions
+  unrestricted. The static-deny list above is drawn to be safe
+  for a non-gaia session too — teammates should never need to
+  edit `.claude/hooks/gaia-*.js` or `.git/**` as part of
+  ordinary work, and writes under `.gaia-state/` /
+  `.gaia-context/` are gaia-only surfaces that do not exist in
+  a typical non-gaia tree.
 - `permissions.deny` Bash patterns are coarser than the shim's
   parser — they do not decode `bash -c`, subshells, or
   redirects. The shim catches those forms.
@@ -1059,11 +1274,28 @@ every matching tool call because:
   Stop hook) pushes to state branches from inside the same
   session. Only the shim can make the "writes from tool calls
   but not from the hook's own git push" distinction.
+- MCP tool calls (`mcp__*`) are banned in gaia v1 (§5)
+  because gaia has not yet modeled their write semantics; the
+  shim denies every `mcp__*` tool call in gaia sessions as a
+  runtime safety net, even though `gaia init` / `gaia doctor`
+  are expected to verify the routine is MCP-free at setup.
+
+**Path anchoring.** Every path in the deny list above uses a
+leading `/` to anchor it to the project root
+(`$CLAUDE_PROJECT_DIR`). Claude Code's permission syntax
+distinguishes project-root-relative paths (`/path`) from
+cwd-relative paths (`path` or `./path`); without anchoring,
+the rule binds to whatever directory Claude has `cd`'d into,
+which can diverge from the repo root mid-session. Anchored
+paths are stable under `cd` and match both the shim's
+`$CLAUDE_PROJECT_DIR`-rooted checks and the doctor's
+end-to-end denial probes.
 
 The two layers compose — denial from either is honored.
 Duplication is accepted as defense in depth; drift is
-contained by `gaia doctor` (§8.4 step 12) exercising at least
-one operation from each static-deny category end-to-end.
+contained by `gaia doctor --cloud`'s `PreToolUse` denial probe
+(§8.4) exercising at least one operation from each static-deny
+category end-to-end.
 
 **Why `$CLAUDE_PROJECT_DIR`, not a relative path.** Hook commands
 execute with the session's current working directory, which Claude may
@@ -1213,11 +1445,19 @@ repo. Each:
      transcript, no last_assistant_message, and failure to push
      simply falls through to the timeout path.
 
-This means a teammate who opens Claude Code on the repo without gaia
-installed sees no disruption for their own (non-gaia) prompts: the
-shim runs, classifies the session as non-gaia, exits 0. A gaia
-session in the same environment would fail explicitly rather than
-silently — which is what the driver wants.
+This means a teammate who opens Claude Code on the repo without
+the global gaia binary installed sees no disruption for their
+own (non-gaia) prompts **as long as Node is on `PATH`**: the
+shim runs, classifies the session as non-gaia, exits 0. If Node
+is *not* on `PATH`, the `command` entry fails to start and
+Claude Code reports a hook error regardless of whether the
+prompt was gaia — §5 documents Node 20+ as a hard prerequisite
+for any environment opening Claude Code in a gaia-initialized
+repo for exactly this reason. The "non-gaia sessions run
+unaffected" property is conditional on Node being available; it
+is not unconditional. A gaia session in the same environment
+(with Node but without the global gaia binary) fails explicitly
+rather than silently — which is what the driver wants.
 
 **Protocol-version invariant.** The committed shim's protocol
 version, the manifest's `driver_version` (§7.4), and the global
@@ -1305,19 +1545,24 @@ any nested submodules do not redirect the command.
    the same `{"decision": "block", "reason": ...}` path as step 2.
 4. Write `<runtime-dir>/<session_id>.json` with
    `{run_id, work_branch, state_branch, experimental_mode,
-   driver_version}`, where `<runtime-dir>` is `$XDG_RUNTIME_DIR/gaia/`
-   when set and `/tmp/gaia-$uid/` otherwise. The directory is
-   created with mode `0700`; the file is written with mode `0600`,
-   `O_NOFOLLOW`, and `session_id` is rejected if it does not match
-   `^session_[0-9A-Za-z_-]+$` (defense against path traversal). The
-   tmp file is the **operational source of truth** for the `Stop`,
-   `StopFailure`, and `PreToolUse` hooks during the session — they
-   key by `session_id` and read branch names from this file rather
-   than from any git config the agent could overwrite. The file is
-   **not secret** and is not tamper-proof against a hostile in-VM
-   actor with shell access (§16.1); the directory permissions and
-   `O_NOFOLLOW` are about preventing accidental cross-user reads
-   and symlink attacks, not about authenticating the agent.
+   driver_version, managed_file_hashes}`, where `<runtime-dir>`
+   is `$XDG_RUNTIME_DIR/gaia/` when set and `/tmp/gaia-$uid/`
+   otherwise. `managed_file_hashes` is copied from
+   `manifest.managed_file_hashes` (§7.4) and consumed by §8.2
+   step 6's integrity spot-check. The directory is created with
+   mode `0700`; the file is written with mode `0600`,
+   `O_NOFOLLOW`, and `session_id` is rejected if it does not
+   match `^session_[0-9A-Za-z_-]+$` (defense against path
+   traversal). The tmp file is the **operational source of
+   truth** for the `Stop`, `StopFailure`, and `PreToolUse`
+   hooks during the session — they key by `session_id` and
+   read branch names and managed-file hashes from this file
+   rather than from any git config the agent could overwrite.
+   The file is **not secret** and is not tamper-proof against
+   a hostile in-VM actor with shell access (§16.1); the
+   directory permissions and `O_NOFOLLOW` are about preventing
+   accidental cross-user reads and symlink attacks, not about
+   authenticating the agent.
 5. **Convenience-only** side channel for Claude's own Bash tool
    reads: persist the *work branch* (only) to git config so prompts
    that read it via `git config --get gaia.workBranch` (see §9) work
@@ -1343,20 +1588,22 @@ any nested submodules do not redirect the command.
    ```
    Local-branch name matches the remote target so the Claude Code
    GitHub proxy's "push to current working branch" check (§8.2 step
-   7) is satisfied for any subsequent push from this branch. After
+   9) is satisfied for any subsequent push from this branch. After
    checkout, `.claude/hooks/gaia-*.js` and `.claude/settings.json`
    on the worktree are guaranteed by the driver's synthesis step
    (§6.1 step 2, §8.8).
 7. If the payload contains `--- CONTEXT FILE ---`, fetch the state
    branch, copy `.gaia-state/context.md` into the worktree at
-   `.gaia/runs/<run_id>/context.md` (the `.gaia/` rule in `.gitignore`
-   keeps it out of any commit), and emit `additionalContext` pointing
-   Claude at the file:
+   `.gaia-context/<run_id>/context.md` (the `.gaia-context/` rule
+   in `.gitignore` keeps it out of any commit; `.gaia-context/` is
+   a read-allowed, write-denied namespace per §8 so Claude can
+   read the file but tool calls cannot mutate it), and emit
+   `additionalContext` pointing Claude at the file:
    ```json
    {
      "hookSpecificOutput": {
        "hookEventName": "UserPromptSubmit",
-       "additionalContext": "The user prompt references .gaia/runs/<run_id>/context.md. Read that file before acting — it holds the task content that did not fit inline."
+       "additionalContext": "The user prompt references .gaia-context/<run_id>/context.md. Read that file before acting — it holds the task content that did not fit inline."
      }
    }
    ```
@@ -1421,27 +1668,70 @@ would silently hit the wrong repo.
    the trust model treats the prompt boundary as the trust
    boundary, and the `PreToolUse` hook (§8.5) blocks edits to the
    shim files and to `.gaia-state/`.
-3. **Verify the current branch is the work branch.** If not,
-   attempt `git -C "$cd" checkout -B "$GAIA_WORK_BRANCH"
-   "refs/remotes/origin/$GAIA_WORK_BRANCH"` and re-verify with
-   `git -C "$cd" symbolic-ref --short HEAD`. If the work branch
-   cannot be re-acquired (Claude may have left the repo in an
-   unexpected state — detached HEAD, missing branch ref), skip the
-   final sweep, fall through to step 6 to push a `GAIA_FAILED:
-   <session_id>` sentinel carrying
-   `{error: "work-branch-not-current"}`, and exit 1. The
-   `PreToolUse` hook (§8.5) blocks `git checkout` / `git switch` /
-   `git reset --hard` for gaia sessions, so this fallback is
-   defense-in-depth rather than a routine path.
-4. **Final commit sweep (conditional) then push (unconditional).**
-   Root every command at `$CLAUDE_PROJECT_DIR` and explicitly exclude
-   `.gaia/` from staging — the agent may have modified `.gitignore`
-   during the session, and the belt-and-suspenders pathspec excludes
-   `.gaia/` regardless.
+3. **Verify the current branch is the work branch.** Run
+   `git -C "$cd" symbolic-ref --short HEAD` (and fall back to
+   `git rev-parse HEAD` if HEAD is detached). If the current
+   branch is not `$GAIA_WORK_BRANCH`, the hook does **not**
+   reset the local work branch to the remote tip — doing so
+   would destroy any commits the session made locally before
+   ending up on a different branch. Instead:
+   1. Capture the current HEAD commit sha.
+   2. Push that sha to a rescue ref:
+      ```
+      git -C "$cd" push origin \
+        "$CURRENT_HEAD:refs/heads/claude/gaia/$GAIA_RUN_ID/rescue/$session_id"
+      ```
+      The `claude/gaia/*` namespace is in the proxy's default
+      push allowlist, so the rescue push is authorized.
+   3. Skip the final sweep (step 4 below).
+   4. Fall through to step 7 to push a `GAIA_FAILED:
+      <session_id>` sentinel carrying
+      `{error: "work-branch-not-current",
+      current_branch: "<whatever HEAD was>",
+      rescue_ref: "claude/gaia/$GAIA_RUN_ID/rescue/$session_id"}`,
+      and exit 1.
+   5. `gaia recover` surfaces the rescue ref in its output so
+      the user can inspect or merge it manually. The driver
+      does not auto-merge rescue refs — the reason for the
+      wrong-branch state is unknown, and a blind merge could
+      land unintended commits.
+
+   The `PreToolUse` hook (§8.5) blocks `git checkout` /
+   `git switch` / `git reset --hard` for gaia sessions, so this
+   fallback is defense-in-depth rather than a routine path; the
+   rescue-ref approach is conservative for the rare cases where
+   something upstream of the hook (a shell escape the parser
+   missed, a hostile prompt injection that evaded `PreToolUse`,
+   a Claude Code bug) leaves the session's HEAD somewhere
+   unexpected.
+4. **Defensive restore of gaia-managed files.** Before the sweep,
+   restore the gaia-managed files from HEAD — this reverts any
+   modifications the session made to them (which `PreToolUse`
+   should have blocked, but defense in depth). These files are
+   known-good on the work-branch HEAD because §8.8 synthesis
+   ran against the default-branch copies before `/fire`:
+   ```
+   git -C "$cd" checkout HEAD -- \
+     .claude/hooks/gaia-user-prompt-submit.js \
+     .claude/hooks/gaia-pre-tool-use.js \
+     .claude/hooks/gaia-stop.js \
+     .claude/settings.json \
+     .gitignore 2>/dev/null || true
+   ```
+   The `|| true` handles the case where the agent deleted one
+   of these files (subsequent sweep will catch the delete and
+   restore via checkout-from-HEAD is already done).
+5. **Final commit sweep (conditional) then push (unconditional).**
+   Root every command at `$CLAUDE_PROJECT_DIR` and exclude
+   `.gaia/`, `.gaia-state/`, and `.gaia-context/` from staging
+   — the agent may have modified `.gitignore` during the
+   session, and belt-and-suspenders pathspec exclusions keep
+   gaia-owned paths out of the commit regardless.
    ```bash
    cd="$CLAUDE_PROJECT_DIR"
-   if [ -n "$(git -C "$cd" status --porcelain -- ':!.gaia')" ]; then
-     git -C "$cd" add -A -- ':!.gaia'
+   excludes=( ':!.gaia' ':!.gaia-state' ':!.gaia-context' )
+   if [ -n "$(git -C "$cd" status --porcelain -- "${excludes[@]}")" ]; then
+     git -C "$cd" add -A -- "${excludes[@]}"
      git -C "$cd" commit -m "gaia: final sweep"
    fi
    git -C "$cd" push origin "$GAIA_WORK_BRANCH:$GAIA_WORK_BRANCH"
@@ -1453,13 +1743,26 @@ would silently hit the wrong repo.
    Claude Code GitHub proxy's "push to current working branch" rule
    sees a name-matched refspec from the same-named local branch
    (verified in step 3).
-5. **Extract the final assistant message** from the stdin
+6. **Integrity spot-check on gaia-managed files.** After the
+   sweep commit (or after confirming no sweep was needed),
+   compute the sha256 of each gaia-managed file in the tree
+   and compare to the expected hashes recorded in the manifest
+   (§7.4 can be extended with a `managed_file_hashes` map
+   populated at fire time from the default-branch copies). If
+   any hash mismatches, push a `GAIA_FAILED:` sentinel with
+   `{error: "managed-files-tampered", mismatches: [...]}` and
+   exit 1 — do not push the work branch. This catches the case
+   where step 4's restore missed a path (e.g., a newly-added
+   hook file the driver's version does not know about) or a
+   `PreToolUse` denial was bypassed. Protocol mutations cannot
+   flow back to the user branch via the merge-back that way.
+7. **Extract the final assistant message** from the stdin
    `last_assistant_message` field. If missing or empty, fall back to a
    reverse-scan of the JSONL transcript (looking for the last line
    where `message.role === "assistant"` or `type === "assistant"`,
    concatenating text blocks). Last-resort fallback: the raw last line
    of the JSONL — still human-readable and the driver will print it.
-6. **Build the readable transcript** by one forward pass through the
+8. **Build the readable transcript** by one forward pass through the
    JSONL. For each line where `message.role` is `user` or
    `assistant`, emit a Markdown section:
    ```
@@ -1472,7 +1775,7 @@ would silently hit the wrong repo.
    Tool-result entries are summarized as `[tool-result: ok]` or
    `[tool-result: error — <first line>]` inline under the preceding
    assistant message. Thinking blocks are dropped.
-7. **Write both artifacts** via a temporary worktree seeded at the
+9. **Write both artifacts** via a temporary worktree seeded at the
    state-branch tip as a **real local branch with the same name as
    the remote target**, then push with an explicit name-matched
    refspec. Claude Code's GitHub proxy "restricts git push
@@ -1513,10 +1816,10 @@ would silently hit the wrong repo.
    the proxy rejects state-branch writes on this repo, doctor fails
    loudly and gaia is unusable on this repo until the proxy
    permissions are widened.
-8. Exit 0.
+10. Exit 0.
 
 The sentinel push is the only way the driver learns the session is
-done; the hook must not exit before completing step 7.
+done; the hook must not exit before completing step 9.
 
 **Exit-code semantics.** `Stop` processes JSON decision output on
 exit 0 (see §15.2 for the experimental continuation path that uses
@@ -1543,15 +1846,19 @@ The hook:
 
 1. Looks up `<runtime-dir>/<session_id>.json` (§8.1 step 4). No-op
    if absent.
-2. Best-effort attempt at the §8.2 step 3 current-branch check and
-   the §8.2 step 4 final-sweep + work-branch push. The API error
-   may have damaged the VM state; failures here are logged but do
-   not block the failure sentinel.
+2. Best-effort attempt at the §8.2 step 3 current-branch check
+   and the §8.2 steps 4–5 defensive-restore + final-sweep +
+   work-branch push. The API error may have damaged the VM
+   state; failures here are logged but do not block the failure
+   sentinel. The integrity spot-check (§8.2 step 6) is skipped
+   on StopFailure — landing a sentinel is higher priority than
+   blocking the final-message push on a hash mismatch when the
+   session is already failing.
 3. Writes `.gaia-state/<session_id>.error.json` containing
    `{error, error_details, last_assistant_message}` and
    `.gaia-state/<session_id>.transcript.md` (whatever transcript
    content exists) to the state branch via the same name-matched
-   local-branch temporary-worktree flow as §8.2 step 7. The
+   local-branch temporary-worktree flow as §8.2 step 9. The
    worktree's local branch is `$GAIA_STATE_BRANCH` (matching the
    remote name) and the push uses an explicit
    `$GAIA_STATE_BRANCH:$GAIA_STATE_BRANCH` refspec. Retry on
@@ -1579,28 +1886,74 @@ readable transcript artifact. The parser:
 - Extracts text defensively (string OR array-of-blocks).
 - Falls back to raw-last-line output on unrecognized shapes.
 
-`gaia doctor` (§6.4) runs an end-to-end synthetic session and verifies:
+`gaia doctor` runs in tiers, because the driver machine and the
+cloud VM are separate environments with overlapping-but-not-
+identical surfaces. The driver machine has no guarantee of a
+local `claude` binary (§1 promises teammates can call `gaia`
+without one), so any check that depends on exercising Claude
+Code locally must be opt-in.
 
-1. **Managed-policy / hook-honored check.** Project-level hooks fire
-   on this Claude Code installation. Enterprise installs can
-   neutralize project-level hooks via `disableAllHooks: true` in any
-   effective settings layer or `allowManagedHooksOnly: true` in the
-   managed layer; either silently disables `.claude/hooks/*`.
-   Doctor probes by registering a trivial test hook in a temp
-   directory and confirming it fires end-to-end. If hooks are
-   disabled by managed policy, doctor fails loudly — gaia cannot
-   work in that environment — and includes the specific setting and
-   layer in the error message when detectable so the user knows
-   which admin surface to take to their Claude Code administrator.
-   Run on both the driver machine (so the teammate-local Claude
-   Code surface works) and the cloud VM (so the gaia protocol works
-   at all).
+**Tiers:**
+
+- `gaia doctor --cloud` — the **required** tier. Fires a
+  synthetic cloud session via the configured routine and
+  exercises everything that can be verified end-to-end in the
+  VM: spawner contract, work/state branch push permissions,
+  hook schema, `PreToolUse` enforcement, MCP prohibition,
+  managed-policy honoring *on the VM*, `StopFailure`
+  registration, beta-header freshness. This is what `gaia
+  init` offers to run at the end of setup and what users
+  should run before relying on the pipeline. Requires no
+  local `claude` install.
+- `gaia doctor --local` — optional. Requires `claude`
+  installed on the driver machine. Exercises the local
+  teammate surface: that project-level hooks fire in a local
+  `claude` session (i.e., managed policy on *this* machine
+  does not disable them), that the Node shim classifies
+  non-gaia sessions correctly, and that the Node prerequisite
+  is satisfied on `PATH`. If `claude` is not installed, this
+  tier prints a short banner naming the checks it would run
+  and exits 0 — the surface it covers is teammate-local, so
+  a driver machine without `claude` is legitimately unable
+  to verify it.
+- `gaia doctor --full` — runs both tiers. Fails if `--local`
+  would fail.
+- `gaia doctor` with no tier flag defaults to `--cloud`. The
+  `gaia init` completion hook runs `--cloud` unless the user
+  passes `--full` on the init command line.
+
+The tiers share a single report format; a check performed in
+the cloud tier does not repeat in the local tier.
+
+**Cloud tier checks (`gaia doctor --cloud`).** Every check below
+runs inside a cloud session that has cloned the configured
+repo at its default branch. The managed-policy probe therefore
+reflects what `/fire` will experience in practice — not a temp
+directory with a scratch repo.
+
+1. **Managed-policy / hook-honored check on the VM.**
+   Enterprise installs can neutralize project-level hooks via
+   `disableAllHooks: true` in any effective settings layer or
+   `allowManagedHooksOnly: true` in the managed layer; either
+   silently disables `.claude/hooks/*`. Doctor's synthetic
+   `/fire` includes a `GAIA_DOCTOR_BEACON: <nonce>` line
+   inside the `--- BEGIN GAIA CONTROL ---` block that the
+   `UserPromptSubmit` shim echoes into a beacon commit on the
+   doctor run's state branch if it fires. If the beacon does
+   not appear within the usual poll window, hooks did not
+   fire on the VM (most likely managed policy), doctor fails
+   loudly, and includes the specific setting and layer in the
+   error message when the VM can detect it. Running this
+   probe against the *configured* repo and default branch
+   (rather than a scratch directory) catches the "managed
+   policy set on the cloud environment specifically" case
+   that a temp-directory probe would miss.
 2. Spawner config is valid: 200 on `/fire`, correct response field
    names (`claude_code_session_id`, `claude_code_session_url`).
 3. Cloud repository access is configured and the session can push to
    both `claude/gaia/<doctor_run_id>/work` **and**
    `claude/gaia/<doctor_run_id>/state` from inside the VM. This is
-   the release gate for §8.2 step 7's name-matched local-branch
+   the release gate for §8.2 step 9's name-matched local-branch
    state push — if the proxy rejects the state-branch write (e.g.,
    the repo has narrower `claude/*` permissions than the default,
    or the proxy's "current working branch" check rejects the
@@ -1618,32 +1971,52 @@ readable transcript artifact. The parser:
    regression in production.
 5. The work branch the session sees after `UserPromptSubmit` checkout
    contains `.claude/hooks/gaia-stop.js`, `.claude/hooks/
-   gaia-pre-tool-use.js`, and `.claude/settings.json` at the current
-   driver's expected version. Catches broken `gaia init` states and
-   confirms §6.1 step 2's synthesis commit took effect.
-6. **Protocol-version invariant.** The committed shim, the global
-   `gaia-hook-*` binary on the driver machine, and the global
-   binary on the VM all advertise the same protocol version. The
-   driver records the manifest's `driver_version` and confirms the
-   hook tmp file's `driver_version` matches. Catches the cloud
-   environment-cache skew problem: setup scripts cache for ~7 days,
-   so a freshly published gaia version may not reach the VM until
-   the cache rolls over. The `UserPromptSubmit` shim's fail-closed
-   path (§8.0 step 6) catches this in production; doctor catches it
+   gaia-pre-tool-use.js`, `.claude/hooks/gaia-user-prompt-submit.js`,
+   and `.claude/settings.json` — including the full
+   `permissions.deny` block (§8) — at the current driver's
+   expected version. Catches broken `gaia init` states, confirms
+   §6.1 step 2's synthesis commit took effect, and catches the
+   case where a stale feature branch lost the deny rules during
+   a merge. The doctor hook computes sha256 of each gaia-managed
+   file and of the `permissions.deny` subset and compares to the
+   expected values passed in via the doctor's `--- BEGIN GAIA
+   CONTROL ---` block.
+6. **No MCP servers configured.** The doctor hook enumerates
+   every `mcp__*` tool name visible to the session (via
+   Claude Code's tool catalog) and pushes the list to a
+   doctor-only state ref. If any `mcp__*` tool is available,
+   doctor fails with the specific MCP server names and points
+   at the §5 prerequisite to remove them from the cloud
+   environment and from any connector attached to the
+   routine. v1 bans MCP in gaia sessions (§2, §8.5); this is
+   the release-gate probe.
+7. **Protocol-version invariant.** The committed shim and the
+   global binary on the VM advertise the same protocol
+   version. Catches the cloud environment-cache skew problem:
+   setup scripts cache for ~7 days, so a freshly published
+   gaia version may not reach the VM until the cache rolls
+   over. The `UserPromptSubmit` shim's fail-closed path (§8.0
+   step 6) catches this in production; doctor catches it
    before any user run does.
-7. The `UserPromptSubmit` shim **fails closed** when the global
-   `gaia-hook-user-prompt-submit` binary is absent or version-
-   skewed: a gaia-authored prompt emits a `{"decision": "block"}`
-   output and the session does not proceed, while a non-gaia
-   prompt in the same environment exits 0 silently. Doctor
-   simulates the binary-missing and version-skew states by
-   temporarily shadowing `$PATH`.
-8. The `UserPromptSubmit` hook receives the expected stdin fields.
-9. `last_assistant_message` is present on the `Stop` input on this
-   Claude Code version.
-10. The JSONL transcript on this version parses into the expected
+8. **Shim fails closed when the binary is absent or
+   version-skewed *on the VM*.** The cloud-only version of
+   the fail-closed probe: the doctor's `UserPromptSubmit`
+   payload carries an `expected_driver_version` field the
+   shim checks against its own pinned protocol version, and
+   doctor verifies the shim's `{"decision": "block"}` output
+   fires when the expected version disagrees. The probe does
+   not temporarily shadow `$PATH` (the local driver cannot
+   reach into the cloud VM's environment to do that); it
+   relies on the existing protocol-version check in §8.0
+   step 4 instead. Shim-without-binary coverage on teammate
+   machines is the local tier's job.
+9. The `UserPromptSubmit` hook receives the expected stdin fields
+   on the current Claude Code version.
+10. `last_assistant_message` is present on the `Stop` input on this
+    Claude Code version.
+11. The JSONL transcript on this version parses into the expected
     forward-pass output.
-11. `StopFailure` is a recognized event. Inducing a real
+12. `StopFailure` is a recognized event. Inducing a real
     `StopFailure` synthetically is non-trivial — it requires an
     API error late in a session (rate-limit, auth, overloaded,
     prompt-too-long) and burns real quota. Doctor therefore
@@ -1663,11 +2036,13 @@ readable transcript artifact. The parser:
       path is recorded in the doctor report as "unexercised"
       rather than "verified" when the live probe did not run,
       so operators know the coverage state.
-12. **`PreToolUse` denials work end-to-end.** Doctor fires a session
+13. **`PreToolUse` denials work end-to-end.** Doctor fires a session
     whose prompt instructs Claude to attempt one operation from
     each gaia-protected category (edit `.claude/hooks/gaia-stop.js`,
-    `git checkout main`, `git push origin claude/gaia/<id>/state`)
-    and confirms the `PreToolUse` shim's
+    edit `.gaia-state/x`, edit `.gaia-context/x`, `git checkout
+    main`, `git push origin claude/gaia/<id>/state`, and — if any
+    MCP tool surfaces despite step 6 — an `mcp__*` call) and
+    confirms the `PreToolUse` shim's
     `hookSpecificOutput.permissionDecision: "deny"` response is
     honored — Claude does not perform the operation — and that
     the session can complete normally otherwise. If any denial is
@@ -1677,11 +2052,11 @@ readable transcript artifact. The parser:
     no-ops, so confirming the current envelope shape is honored
     is the difference between a working protection surface and a
     hook that returns JSON nobody parses.
-13. No foreign project-level handler has appeared on
+14. No foreign project-level handler has appeared on
     `UserPromptSubmit`, `Stop`, or `StopFailure` since install
     (§8.7). For `PreToolUse`, doctor checks for matcher overlap
     with gaia's protected matchers and warns rather than fails.
-14. **Beta header staleness.** The configured
+15. **Beta header staleness.** The configured
     `spawner_config.beta_header` (§10.1) is still accepted by
     `/fire`. Doctor fires a minimal synthetic request with the
     configured header; if the response or error envelope
@@ -1695,11 +2070,59 @@ readable transcript artifact. The parser:
     — but a second failed doctor run with the same stale header
     escalates to a fail so stale-header conditions do not
     accumulate silently.
-15. (If `--experimental-mode` is configured) the experimental-mode
+16. **`.gaia/merge.lock` works on this filesystem.** Acquires
+    and releases the lock in-process, confirms blocking
+    behavior with a second process (subprocess), and falls
+    back with a loud warning if the platform lacks working
+    `flock` / `LockFileEx`. A filesystem without working
+    advisory locks (rare — typically network shares or
+    filesystems mounted `-o nolock`) means same-checkout
+    concurrency guards degrade to best-effort. Not a release
+    gate because the common case works, but the warning lets
+    users pick a different working tree if they need hard
+    serialization.
+17. (If `--experimental-mode` is configured) the experimental-mode
     flow from §15.7 completes.
 
-`gaia init` offers to run `gaia doctor` automatically before declaring
-setup complete.
+**Local tier checks (`gaia doctor --local`).** These all require
+`claude` installed on the driver machine:
+
+L1. **Managed-policy / hook-honored check on *this* machine.**
+    The local analogue of cloud step 1. Registers a trivial
+    test hook in a temp directory and confirms it fires via
+    `claude -p`. If the local Claude Code has `disableAllHooks:
+    true` or `allowManagedHooksOnly: true` such that project
+    hooks are inert, the driver machine cannot open a gaia-
+    initialized repo locally without disrupting the session;
+    teammates on this machine will see hook-start failures.
+    Fails the local tier; the cloud tier is unaffected.
+L2. **Node on `PATH`.** The committed shims start with `node`
+    (§8.0). If Node 20+ is not on the local shell's `PATH`,
+    any `claude` session that opens this repo will fail at
+    hook-start regardless of whether the session is gaia.
+    Fails the local tier.
+L3. **Shim classifies non-gaia sessions correctly.** Opens a
+    local `claude` session with a plain prompt (no `--- BEGIN
+    GAIA CONTROL ---` fence) and confirms the shim exits 0
+    silently — no `decision: "block"`, no `PreToolUse` denies,
+    no `Stop`-hook sentinel push. This is the "teammate opens
+    Claude Code in the repo without gaia installed" path; it
+    must not disrupt their session.
+L4. **Shim fails closed on the driver when the global binary
+    is missing.** Temporarily shadows `$PATH` so the
+    `gaia-hook-*` binary is not resolvable, opens a local
+    `claude` session with a gaia-authored prompt (via
+    doctor's internal fire-helper that bypasses the routine),
+    and confirms the shim blocks with the documented
+    fail-closed output (§8.0 step 6). Local-only because the
+    `$PATH` shadow is a local driver operation — the cloud
+    tier covers the version-skew case via the protocol
+    version check (cloud step 8).
+
+`gaia init` offers to run `gaia doctor --cloud` (the required
+tier) automatically before declaring setup complete; it
+prints a hint to run `gaia doctor --local` on any machine
+where teammates plan to open the repo in `claude`.
 
 ### 8.5 `gaia-hook-pre-tool-use` (PreToolUse event)
 
@@ -1745,15 +2168,30 @@ injected from repo content (§16.1).
    `NotebookEdit`, or `Bash` with a write-like subcommand —
    `rm`, `mv`, `cp`, `tee`, `truncate`, `chmod`, redirect-to,
    `dd of=`, `git rm`, etc.) that targets one of the following
-   paths is denied:
+   paths is denied. All paths are resolved against
+   `$CLAUDE_PROJECT_DIR` and rejected if a symlink resolves
+   through a protected location:
    - `.claude/hooks/gaia-*.js`
    - `.claude/settings.json` — the file as a whole; the rule is
-     paranoid because partial edits could disable individual hooks
+     paranoid because partial edits could disable individual
+     hooks (or strip gaia's `permissions.deny` entries the
+     work-branch invariant in §8.8 reconciles)
    - `.gitignore` — only edits that remove or alter the `.gaia/`
-     line; other `.gitignore` edits are allowed (Claude may
-     legitimately add ignore rules during development)
-   - `.gaia/**` (driver-local state; should not exist in the VM but
-     is locked down for safety)
+     or `.gaia-context/` lines; other `.gitignore` edits are
+     allowed (Claude may legitimately add ignore rules during
+     development)
+   - `.gaia/**` (driver-local state; should not exist in the VM
+     but is locked down for safety)
+   - `.gaia-state/**` (the state-branch namespace; writes are
+     the Stop hook's exclusive surface, not Claude's. The work
+     branch may contain a `.gaia-state/` directory if the agent
+     accidentally materializes one in the worktree; this rule
+     blocks that. Stop-hook writes go through a separate
+     worktree seeded on the state branch (§8.2 step 9) and are
+     unaffected)
+   - `.gaia-context/**` (overflow-context namespace; read-only
+     from Claude's perspective. The `UserPromptSubmit` hook
+     materializes files here; tool calls must not mutate them)
    - `.git/**`
 4. **Protected commands.** `Bash` calls whose decoded subcommand
    matches one of these patterns are denied. The shim tokenizes
@@ -1834,13 +2272,29 @@ injected from repo content (§16.1).
    | `eval "$(printf 'git checkout main')"` | allow (eval contents not statically decodable; §16.1) |
    | `git status` / `git log` / `git diff` | allow |
    | `git add -A && git commit -m "..."` | allow on a non-protected path change |
-5. **Allow-list overrides.** Claude must still be able to commit on
+5. **MCP tool calls are denied in gaia v1.** Any tool call whose
+   `tool_name` matches `^mcp__` is denied in a gaia session with
+   reason `"gaia v1 does not support MCP / connector tools;
+   routines attached to gaia runs must be MCP-free (§5)"`. gaia
+   does not model the write semantics of arbitrary MCP servers
+   (a GitHub connector can mutate repo state, a filesystem
+   connector can write anywhere, etc.), so the `PreToolUse`
+   matcher above covers `mcp__.*` and the shim blocks the call
+   rather than trying to classify it. This is belt-and-
+   suspenders — `gaia init` / `gaia doctor` are expected to
+   verify the routine has no connectors at setup time (§5,
+   §8.4) — but a misconfigured routine that exposes an MCP
+   tool to Claude will still have its calls rejected at
+   runtime. A future release may introduce an MCP allow-list in
+   gaia config once the write-surface of common connectors is
+   better understood (§14).
+6. **Allow-list overrides.** Claude must still be able to commit on
    the work branch, push the work branch (the Stop hook does this,
    but agents may also push intermediate progress), read any of the
    protected files, and run `git status` / `git log` / `git diff`
    freely. The shim only blocks *write* and *branch-switch*
    operations — read paths are not in the protected set.
-6. **Decision output.** When denying, emit the documented
+7. **Decision output.** When denying, emit the documented
    `PreToolUse` deny envelope:
    ```json
    {
@@ -1858,18 +2312,26 @@ injected from repo content (§16.1).
    deprecated on current Claude Code — on the legacy envelope,
    `"block"` (not `"deny"`) maps to a denial, so a top-level
    `"deny"` silently no-ops. gaia deliberately uses the current
-   shape and `gaia doctor` (§8.4 step 12) confirms an end-to-end
-   denial is honored before any real run depends on it. When
-   allowing, exit 0 with no JSON output.
+   shape and `gaia doctor --cloud`'s `PreToolUse` denial probe
+   (§8.4) confirms an end-to-end denial is honored before any
+   real run depends on it. When allowing, exit 0 with no JSON
+   output.
 
 **Coexistence with other `PreToolUse` handlers.** `PreToolUse`
 accepts per-tool matchers, so multiple project-level handlers can
 coexist without races as long as their matchers are disjoint.
 gaia's matcher set is documented in §8 (the `.claude/settings.json`
-block above): `Edit|Write|MultiEdit|Bash|NotebookEdit`. Other
-tools (e.g., `Read`, `Glob`, `Grep`, `Task`) are unmatched by gaia
-and can have their own handlers without conflict. If a foreign
-handler matches one of gaia's tools, doctor warns at §8.4 step 13.
+block above):
+`Edit|Write|MultiEdit|Bash|NotebookEdit|mcp__.*`. Other tools
+(e.g., `Read`, `Glob`, `Grep`, `Task`) are unmatched by gaia and
+can have their own handlers without conflict. A foreign handler
+whose matcher overlaps gaia's (most notably another `mcp__.*`
+handler, since MCP is a v1 ban surface) is a warning-not-fail at
+§8.4 because the most-restrictive rule means a denial
+from either handler is honored — but a sibling handler that
+*allows* gaia-protected writes cannot override gaia's deny in
+parallel execution. Doctor warns so the repo owner can confirm
+the composition is intentional.
 
 **Failure modes.** Claude Code's hook semantics require the shim
 to exit 0 with the right JSON envelope to be considered a
@@ -1899,7 +2361,7 @@ sessions is:
 3. **Shim timeout (30 s per §8).** Claude Code's default is
    fail-open. gaia does not try to convert this to fail-closed
    — a stuck process cannot emit any JSON — and `gaia doctor`
-   (§8.4 step 12) verifies the shim stays well under the timeout
+   (§8.4) verifies the shim stays well under the timeout
    on realistic inputs so a production timeout indicates a
    genuine bug to chase.
 4. **Non-gaia session.** Every branch above is conditional on
@@ -1954,13 +2416,13 @@ the project-settings layer with other handlers safely:
 
 `PreToolUse` is different: it accepts per-tool matchers, so
 multiple handlers with disjoint matcher sets coexist cleanly.
-gaia's matcher (`Edit|Write|MultiEdit|Bash|NotebookEdit`; §8.5) is
-narrow enough that a project can register its own `PreToolUse`
-handlers on other tools without conflict. Even within gaia's
-matcher set, parallel handlers can coexist as long as none of them
-denies a tool call gaia would have allowed (the most-restrictive
-rule means denial wins, which is generally desirable for security
-hooks).
+gaia's matcher (`Edit|Write|MultiEdit|Bash|NotebookEdit|mcp__.*`;
+§8.5) is narrow enough that a project can register its own
+`PreToolUse` handlers on other tools without conflict. Even
+within gaia's matcher set, parallel handlers can coexist as long
+as none of them denies a tool call gaia would have allowed (the
+most-restrictive rule means denial wins, which is generally
+desirable for security hooks).
 
 **v1 policy: gaia owns the three exclusive events at the
 project-settings layer, per repo, and shares `PreToolUse` with
@@ -2057,17 +2519,20 @@ synthesizing a setup commit on the work branch:
    `claude/gaia/$RUN_ID/work` branch (created with
    `git worktree add -B "$GAIA_WORK_BRANCH" "$tmp"
    "refs/remotes/origin/$GAIA_WORK_BRANCH"` — name-matched per
-   §8.2 step 7), read each gaia-managed file from
+   §8.2 step 9), read each gaia-managed file from
    `refs/remotes/origin/<default-branch>` (fetched with an
    explicit refspec):
    - `.claude/hooks/gaia-user-prompt-submit.js`
    - `.claude/hooks/gaia-pre-tool-use.js`
    - `.claude/hooks/gaia-stop.js`
-   - `.claude/settings.json` — only the four gaia event entries
-     are reconciled (merged non-destructively with existing
-     project-layer configuration for other events; §8.7)
-   - `.gitignore` entry for `.gaia/` (appended if missing,
-     existing line left alone if already present)
+   - `.claude/settings.json` — reconciled as the **gaia-managed
+     subset** (see below): the four gaia-hook entries under
+     `hooks.*` plus the `permissions.deny` entries gaia installs.
+     Other keys (other event handlers, custom permissions, model
+     config, etc.) are preserved non-destructively.
+   - `.gitignore` entries for `.gaia/` and `.gaia-context/`
+     (each appended if missing; existing matching lines left
+     alone)
 2. If any file differs from the work-branch copy, write the
    default-branch version into the work-branch tree and stage it.
 3. If anything was staged, commit with message
@@ -2091,13 +2556,44 @@ synthesizing a setup commit on the work branch:
    events" policy at runtime. For `PreToolUse`, perform the same
    scan but emit a warning (not an abort) when a foreign handler's
    matcher overlaps gaia's matcher set (`Edit`, `Write`,
-   `MultiEdit`, `Bash`, `NotebookEdit`) — denial wins in
-   parallel execution, which is the intended composition for
-   security hooks (§8.7); a disjoint matcher is silent. The
-   remediation for the abort case is either `gaia init
-   --force-merge-hooks` (v1.x, not implemented in v1) or merging
-   the default branch into the feature branch before running
-   gaia so the default-branch settings version lands.
+   `MultiEdit`, `Bash`, `NotebookEdit`, `mcp__.*`) — denial
+   wins in parallel execution, which is the intended
+   composition for security hooks (§8.7); a disjoint matcher is
+   silent. The remediation for the abort case is either
+   `gaia init --force-merge-hooks` (v1.x, not implemented in
+   v1) or merging the default branch into the feature branch
+   before running gaia so the default-branch settings version
+   lands.
+
+**The gaia-managed settings subset.** Step 1 reconciles a
+defined subset of `.claude/settings.json`, not the whole file:
+
+- `hooks.UserPromptSubmit` — gaia's entry (matched by `command`
+  referencing `gaia-user-prompt-submit.js`).
+- `hooks.PreToolUse` — gaia's matcher entry (matched by
+  `command` referencing `gaia-pre-tool-use.js` AND the gaia
+  matcher string `Edit|Write|MultiEdit|Bash|NotebookEdit|mcp__.*`).
+- `hooks.Stop` — gaia's entry (matched by `command` referencing
+  `gaia-stop.js`).
+- `hooks.StopFailure` — gaia's entry (matched by `command`
+  referencing `gaia-stop.js`).
+- `permissions.deny` — the full set of gaia-installed deny
+  rules per §8 (paths anchored with `/`, covering `.gaia/**`,
+  `.gaia-state/**`, `.gaia-context/**`, `.claude/hooks/gaia-*.js`,
+  `.claude/settings.json`, `.git/**`, and the protected Bash
+  patterns). Foreign `permissions.deny` entries are preserved
+  on the work branch; gaia only reconciles the subset it
+  owns, identified by exact-string match against the gaia-
+  installed rule set.
+
+Reconciling `permissions.deny` alongside the hook entries
+matters because a stale feature branch that predates a gaia
+security patch (which, e.g., added `.gaia-context/**` to the
+deny list) would otherwise run with weaker defense-in-depth.
+The `permissions.deny` list is the *static* layer of gaia's
+protection surface; keeping it in sync with the default branch
+means the runtime protection matches what the current driver
+version expects.
 
 The commit flows back to the user branch via the standard merge-
 back in §6.1.1, so after the first successful gaia run on a stale
@@ -2127,8 +2623,9 @@ If the context starts with PREVIOUS CONVERSATION: ... END PREVIOUS
 CONVERSATION, treat that as the conversation so far and continue
 from it. The new prompt follows the END PREVIOUS CONVERSATION marker.
 
-If the user message tells you to read a file under .gaia/runs/, read
-it first — it holds the real task content that did not fit inline.
+If the user message tells you to read a file under .gaia-context/,
+read it first — it holds the real task content that did not fit
+inline.
 
 Commit your work with git as you go. You do not need to push — a gaia
 hook will push your final state to the correct branch when you are
@@ -2203,7 +2700,8 @@ This prompt never needs to change per routine or per project.
 
 The `beta_header` value is **volatile**. The `/fire` endpoint is
 research preview and Anthropic may rotate this header on short
-notice; `gaia doctor` (§8.4 step 14) detects the "configured
+notice; `gaia doctor --cloud`'s beta-header probe (§8.4) detects
+the "configured
 header no longer accepted" condition and warns on the first
 failed run, escalating to a fail on the second so stale headers
 do not accumulate silently. Patch releases of gaia will ship
@@ -2218,17 +2716,34 @@ Provided via (in precedence order):
 1. `gaia config set <KEY> <VALUE>` — OS keychain where available,
    `.gaia/secrets.json` (0600, gitignored) fallback.
 2. Ambient environment variable.
-3. `.env` at repo root (gitignored; parsed by gaia on startup).
+3. `.env` at repo root (parsed by gaia on startup when present).
+   gaia does not manage `.env`'s ignore status — `gaia init`
+   warns if `.env` exists but is not covered by an effective
+   ignore rule (§10.4), rather than appending `.env` to
+   `.gitignore` itself, since project conventions around `.env*`
+   vary.
 
 v1 secrets: `GAIA_ROUTINE_URL`, `GAIA_ROUTINE_TOKEN`. (The URL is not
 strictly secret but stored alongside the token for simplicity.)
 
+**Reading secrets back.** `gaia config get <KEY>` redacts values
+for any key matching `*_TOKEN` (case-insensitive) by default —
+output is `<redacted: N chars>` rather than the raw token.
+`gaia config get --show-secret <KEY>` prints the raw value
+after a loud stderr warning. This protects the "secret-aware
+storage" story from an incidental `gaia config get` in a shell
+history, a terminal recording, or a pasted diagnostic. Non-
+token keys print verbatim. Scripts that need to pipe a token
+(e.g., a CI harness) must pass `--show-secret` explicitly, which
+makes the exfiltration path auditable rather than accidental.
+
 ### 10.3 Local state
 
 ```
-.gaia/                                         (gitignored)
+.gaia/                                         (gitignored; driver-local)
   history.jsonl                                append-only terminal-event log for -c / --resume
   history.lock                                 advisory lock for appends
+  merge.lock                                   per-working-tree advisory lock for §6.1.1 merge-back and gaia recover --merge
   transcripts/
     <session_id>.md                            readable conversation transcripts
   secrets.json                                 fallback store (0600)
@@ -2236,8 +2751,22 @@ strictly secret but stored alongside the token for simplicity.)
     <run_id>/
       meta.json                                full per-run metadata (canonical)
       fire.json                                raw spawner response
-      context.md                               overflow context materialized by the hook (only if needed)
+      .lock                                    per-run in-process lock on meta.json rewrites
+.gaia-context/                                 (gitignored; VM-only staging surface)
+  <run_id>/
+    context.md                                 overflow context materialized by UserPromptSubmit (only if needed; never exists in driver-local checkouts under normal use)
 ```
+
+The two top-level directories serve different purposes:
+`.gaia/` is **driver-local** state (history, transcripts,
+secrets fallback, per-run metadata, merge lock) and is
+read-denied to the agent's tool calls (§8). It should never
+contain anything the agent needs to read. `.gaia-context/` is a
+**VM-only** staging surface for content the agent must read
+but the driver owns the lifecycle of (overflow context,
+future variants). Both are gitignored (§10.4); the split is
+what lets `permissions.deny` keep `.gaia/` read-denied without
+blocking the overflow path.
 
 **Source of truth.** `.gaia/runs/<run_id>/meta.json` is canonical.
 `history.jsonl` is a derived append-only event log — one record per
@@ -2256,6 +2785,10 @@ runs directory.
   "user_branch": "feature/auth",
   "work_branch": "claude/gaia/01HXX.../work",
   "state_branch": "claude/gaia/01HXX.../state",
+  "upstream_remote": "origin",
+  "upstream_branch": "feature/auth",
+  "upstream_ref": "refs/heads/feature/auth",
+  "local_only_branch": false,
   "pushed_upstream": true,
   "base_sha": "abc1234",
   "merge_sha": "def5678",
@@ -2267,6 +2800,14 @@ runs directory.
   "error": null
 }
 ```
+
+The `upstream_*` / `local_only_branch` fields mirror the §7.4
+manifest (the manifest is the authoritative cloud-side copy;
+`meta.json` carries the same values driver-side for §6.1.1 and
+`gaia recover`). Recording them at fire time prevents a push
+rejection or a recover call minutes/hours later from
+re-reading a branch's upstream config, which the user might
+have changed in the interim.
 
 The `session_id` and `session_url` fields are written verbatim
 from the `/fire` response (`claude_code_session_id` and
@@ -2352,17 +2893,43 @@ filesystem without working locks), gaia rebuilds from
 
 ### 10.4 `.gitignore`
 
-`gaia init` appends:
+`gaia init` appends two rules, each added only if not already
+present (no duplicate lines on re-run):
 
 ```
 .gaia/
+.gaia-context/
 ```
 
-Only this. `.gaia-state/` lives on orphan state branches exclusively
-and never touches reviewed branches. Overflow context files written
-to `.gaia/runs/<run_id>/context.md` are covered by the top-level
-`.gaia/` rule, so the Stop hook's `git add -A` will never commit them
-to the work branch.
+`.gaia/` covers the driver-local state layout (§10.3). `.gaia-
+context/` covers the VM-side overflow staging directory
+`gaia-hook-user-prompt-submit` materializes the overflow context
+into (§7.2, §8.1). Both rules are kept distinct because the
+driver-local `.gaia/` is read-denied at the permission layer
+(§8) — a path Claude must read during the run cannot live there
+— so the overflow file needs its own namespace, and that
+namespace needs its own ignore rule so the Stop hook's
+`git add -A` never commits it to the work branch.
+
+`.gaia-state/` lives on orphan state branches exclusively and
+never touches reviewed branches. It is also covered by the
+§8.5 protected-paths set on the work branch as belt-and-
+suspenders: the work branch should never contain a
+`.gaia-state/` directory, but a confused agent that materializes
+one in its worktree cannot write through it and the Stop hook's
+sweep explicitly excludes it from staging (§8.2 step 5).
+
+**`.env` handling.** gaia does not append `.env` to `.gitignore`
+automatically — `.env` conventions vary by project (some repos
+intentionally commit an `.env.example`, some ignore `.env*`
+wildcards, some use dotenv-free configuration). `gaia init`
+instead *verifies* that if `.env` is present at the repo root,
+a matching ignore rule is already in effect (via project
+`.gitignore`, `~/.gitignore`, or `.git/info/exclude`); if not,
+it warns and points the user at the remediation. §10.2's
+precedence list reads `.env` when present — treat that as
+"gaia picks up `.env` if you have one" rather than "gaia
+guarantees it is gitignored."
 
 ## 11. Spawner plugin layer
 
@@ -2389,12 +2956,21 @@ Kept abstract for future spawners (§14).
   `anthropic-beta: <beta_header>`, `anthropic-version: 2023-06-01`.
 - Response mapping: `claude_code_session_id` → `sessionId`,
   `claude_code_session_url` → `sessionUrl`.
-- HTTP error mapping. HTTP-error-envelope cases surface as
-  `meta.status = "fire-failed"` per §10.3 (the server parsed the
-  request and returned without creating a session). Ambiguous
-  cases surface as `meta.status = "fire-ambiguous"` per §10.3
-  (the driver cannot prove either outcome). Definite-not-sent
-  network failures are safe to retry and surface as
+- HTTP error mapping. HTTP-error-envelope cases fall into two
+  buckets. Responses that the server contract makes
+  side-effect-free — 400/401/403/404/429, all of which
+  semantically mean "request rejected before work started" —
+  surface as `meta.status = "fire-failed"` per §10.3. 5xx
+  responses are treated as **ambiguous** by default: Anthropic
+  does not document that `/fire` is side-effect-free for 5xx,
+  and a 500/503 can plausibly be returned after the server has
+  already begun creating a session. Since `/fire` has no
+  idempotency key (confirmed in Anthropic's current docs),
+  retrying the same payload with the same `GAIA_RUN_ID` against
+  a possibly-live session would create two sessions racing on
+  the same work/state branches. Ambiguous network failures that
+  could not be classified surface the same way. Definite-not-
+  sent network failures are safe to retry and surface as
   `"fire-failed"` only after retries exhaust:
   | Code | `error.type` | gaia behavior | `meta.status` on exhaustion |
   |---|---|---|---|
@@ -2402,9 +2978,9 @@ Kept abstract for future spawners (§14).
   | 401 | `authentication_error` | Non-retryable. Exit 10. | `fire-failed` |
   | 403 | `permission_error` (entitlement) | Non-retryable. Exit 10. | `fire-failed` |
   | 404 | `not_found_error` (routine id wrong / deleted) | Non-retryable. Exit 12. | `fire-failed` |
-  | 429 | `rate_limit_error` | Honor `Retry-After`. After retries exhausted, exit 11. | `fire-failed` |
-  | 500 | `api_error` | Exponential backoff up to 3 attempts. Then exit 12. | `fire-failed` |
-  | 503 | `overloaded_error` | Exponential backoff up to 3 attempts. Then exit 12. | `fire-failed` |
+  | 429 | `rate_limit_error` | Honor `Retry-After`. Safe to retry with same `GAIA_RUN_ID` — a rate-limited request means the server rejected it before admission. After retries exhausted, exit 11. | `fire-failed` |
+  | 500 | `api_error` | **Ambiguous. No retry with the same `GAIA_RUN_ID`.** Exit 16. Work/state branches preserved for `gaia recover` to poll for a late sentinel. If no sentinel arrives, recovery offers to classify the run as `fire-failed` or retry with a fresh `GAIA_RUN_ID`. | `fire-ambiguous` |
+  | 503 | `overloaded_error` | Same as 500. Exit 16. | `fire-ambiguous` |
   | Definite-not-sent network failure (DNS failure, TCP connect refusal, TLS handshake failure before any request bytes are written) | n/a | Exponential backoff up to 3 attempts. Then exit 5. | `fire-failed` |
   | Ambiguous network failure (TLS error after request body bytes may have been sent, connection reset mid-body or mid-response, read-response timeout, 2xx body that fails to parse `claude_code_session_id`) | n/a | **No retry with the same `GAIA_RUN_ID`.** Exit 16. Work/state branches preserved for `gaia recover`. | `fire-ambiguous` |
 - The classifier for "definite-not-sent" vs "ambiguous" lives in
@@ -2412,10 +2988,23 @@ Kept abstract for future spawners (§14).
   request body enters the socket write buffer is definite-not-
   sent (DNS, TCP, TLS handshake); errors after that point are
   ambiguous unless the client received a complete, parseable
-  4xx/5xx envelope. gaia errs on the side of ambiguous — a
-  failure that cannot be proven definite-not-sent is treated as
+  4xx status envelope from the documented side-effect-free set
+  (400/401/403/404/429). 5xx envelopes are ambiguous even when
+  parseable, because the response body does not prove no
+  session was created. gaia errs on the side of ambiguous — a
+  failure that cannot be proven definite-not-sent or a
+  documented side-effect-free rejection is treated as
   ambiguous, because the cost of a false "fire-failed"
   classification is losing a real running session.
+- **If Anthropic confirms 5xx is side-effect-free.** The 5xx
+  classification above is conservative. If Anthropic publishes
+  a written guarantee that `/fire` 500/503 responses are
+  side-effect-free (no session created) — or, equivalently,
+  adds an idempotency-key header — a patch release can move
+  500/503 back into the retryable `fire-failed` bucket without
+  changing the CLI contract. gaia tracks the conservative
+  behavior as the v1 default and will relax it when the
+  server-side invariant is documented, not assumed.
 - `maxPayloadChars: 65536`, `defaultTimeout: "45m"`.
 - The endpoint returns immediately after session creation — it does
   not stream or wait. gaia's sentinel / polling design is the intended
@@ -2426,7 +3015,8 @@ Kept abstract for future spawners (§14).
 | Failure | Detection | Policy |
 |---|---|---|
 | `-p` missing | Arg parsing | Exit 2 with usage. |
-| Spawner returns parseable HTTP error before session creation | `fire()` rejects with a typed 4xx/5xx envelope | Retry per §11.2 where applicable. On exhaustion, transition `meta.status = "fire-failed"` (`session_id: null`), append a `"fire-failed"` event to `history.jsonl`, delete the freshly-pushed work / state branches from origin (the server proved no session was created), exit 5/10/11/12 per §11.2. |
+| Spawner returns parseable side-effect-free HTTP error | `fire()` rejects with a typed 400/401/403/404/429 envelope | Retry per §11.2 where applicable (429 only). On exhaustion, transition `meta.status = "fire-failed"` (`session_id: null`), append a `"fire-failed"` event to `history.jsonl`, delete the freshly-pushed work / state branches from origin (the documented server contract for these codes is no side effects), exit 10/11/12 per §11.2. |
+| Spawner returns 5xx envelope (500 `api_error` / 503 `overloaded_error`) | `fire()` rejects with a typed 5xx envelope | **Treated as ambiguous** per §11.2. No retry with the same `GAIA_RUN_ID`. Transition `meta.status = "fire-ambiguous"`, preserve work / state branches on origin, exit 16. `gaia recover` polls for a late sentinel; see the ambiguous row below for the resolution flow. |
 | Definite-not-sent network failure | DNS / TCP / TLS error before any request-body bytes written | Retry with same `GAIA_RUN_ID` per §11.2. On exhaustion, `meta.status = "fire-failed"`, branches deleted, exit 5. |
 | Ambiguous `/fire` failure — session may or may not have been created | Any failure after request-body bytes may have reached the socket; 2xx body that fails to parse `claude_code_session_id` | **Never retry with the same `GAIA_RUN_ID`.** Transition `meta.status = "fire-ambiguous"` (`session_id: null`), append a `"fire-ambiguous"` event, **preserve** work/state branches on origin, exit 16. `gaia recover <run_id>` polls the state branch for a late sentinel (§6.4); if one arrives, the run promotes to `"success"` / `"failed"` / `"aborted"` as if the driver had received the sentinel inline. |
 | `GAIA_FAILED:` sentinel received | Poll loop sees failure sentinel | Exit 13. Error body printed. `meta.json.status = "failed"`. Terminal `"failed"` event appended to `history.jsonl`. `gaia recover` offered. |
@@ -2434,7 +3024,7 @@ Kept abstract for future spawners (§14).
 | `GAIA_DONE:` sentinel missing expected artifacts | `GAIA_DONE:` commit lacks `<session_id>.md` or `<session_id>.transcript.md` | Driver treats as suspect (potential forgery per §16.1), logs a warning, continues polling the remaining timeout. If nothing valid arrives, falls through to the timeout path (exit 3). |
 | No sentinel by timeout | Poll loop deadline | Exit 3. Work + state branches preserved. Session URL printed. `meta.json.status = "timeout"`. Recoverable via `gaia recover`. |
 | Merge conflict | `git merge` fails | Abort merge. Exit 4. Work branch preserved; user branch untouched. `meta.json.status = "conflict"`. Recoverable via `gaia recover`. |
-| Push rejected after local merge | `git push origin <user-branch>` fails | Exit 15. Local user branch has the merge commit. `meta.json.status = "push-rejected"`. Printed instructions: investigate upstream advance, then `git push` when ready — or run `gaia recover <id>` which retries the push without re-merging (§6.4). |
+| Push rejected after local merge | `git push $UPSTREAM_REMOTE $USER_BRANCH:$UPSTREAM_BRANCH` fails | Exit 15. Local user branch has the merge commit. `meta.json.status = "push-rejected"`. Printed instructions: investigate upstream advance, then `git push` when ready — or run `gaia recover <id>` which retries the push (using the recorded `meta.upstream_*` fields, not a hardcoded `origin`) without re-merging (§6.4). |
 | User branch diverged non-FF at merge time | `git merge-base --is-ancestor` fails pre-merge | Exit 2 with recovery message. |
 | Dirty working tree at start | `git status --porcelain` non-empty | Exit 2. |
 | Detached HEAD at start | No symbolic ref | Exit 2. |
@@ -2532,11 +3122,25 @@ and the same account.
 
 **What can still conflict:**
 
-- **Merge-back at run-end.** Two parallel runs that both modify the
-  same files on the user branch will conflict when the second merges.
-  Handled per §12 exit 4: abort the merge, preserve the work branch,
-  surface the run id, let the user resolve. This is the same behavior
-  as any concurrent git work and is not specific to gaia.
+- **Merge-back in the same physical checkout.** Two parallel
+  runs whose drivers share a working tree cannot perform
+  §6.1.1 concurrently — both processes want to mutate HEAD
+  and the index. The driver serializes this with an advisory
+  lock on `.gaia/merge.lock` (§6.1.1), held from step 1
+  through step 7 (and released in a `finally`). `gaia recover
+  --merge` acquires the same lock. Concurrent runs in
+  *different* clones do not share this lock and never block
+  each other — the lock is per-working-tree, which is the
+  level at which git operations conflict. If the lock cannot
+  be acquired within 30 s, the second process exits 2 naming
+  the holder's run_id.
+- **Merge-back conflicts at run-end.** Two parallel runs that
+  both modify the same files on the user branch will conflict
+  when the second merges — even with the local lock, the
+  merge itself can fail. Handled per §12 exit 4: abort the
+  merge, preserve the work branch, surface the run id, let
+  the user resolve. This is the same behavior as any
+  concurrent git work and is not specific to gaia.
 - **Spawner quota.** The Claude Code routines daily cap is
   per-account. N parallel invocations draw N times the budget. 429
   from the spawner is terminal for the current window per §11.2.
@@ -2566,9 +3170,11 @@ skip past a newer non-success run to pick up an older success
 *succeeding* thing" when a newer run failed or is unresolved
 is a bug hiding in convenience.
 
-A `.gaia/lock` advisory lock remains future work (§14) for callers
-who want to prevent concurrent merges into a single user branch by
-policy rather than by convention.
+Same-checkout merge-back is serialized via `.gaia/merge.lock`
+(above, §6.1.1). An origin-side advisory lock on the user
+branch — preventing concurrent merges at the repo level rather
+than per-checkout — remains future work (§14) for callers who
+want belt-and-suspenders serialization across unrelated clones.
 
 ## 14. Open questions and future work
 
@@ -2592,8 +3198,13 @@ policy rather than by convention.
   loopx will need. Layers on top of the same protocol described here.
 - **Additional spawners.** `local-claude` (shells out to `claude -p`
   locally — no cloud VM required), `codex`, `github-action`.
-- **Concurrent-branch lock.** `.gaia/lock` or an origin-side advisory
-  lock on the user branch.
+- **Origin-side branch lock.** v1 serializes same-checkout
+  merges via `.gaia/merge.lock` (§6.1.1, §13). A future mode
+  could add an origin-side advisory lock on the user branch
+  for callers who want to serialize merges across unrelated
+  clones (e.g., CI jobs on separate machines). Deferred
+  because the use case is rare in practice and cross-machine
+  locking adds a server-side dependency.
 - **Interactive picker for `--resume`.** `gaia --resume -p "<prompt>"`
   without a session id could show the recent history and prompt for
   selection, matching `claude --resume` without an argument.
@@ -2611,6 +3222,15 @@ policy rather than by convention.
   API from Anthropic or hook credentials isolated from the agent's
   Bash tool would close the trust gap described in §16.1. Neither
   is exposed today.
+- **Session metadata artifact.** Currently the Stop hook pushes
+  only a final-message and transcript artifact alongside each
+  sentinel. Adding a `.gaia-state/<session_id>.meta.json`
+  artifact carrying `{session_id, session_url, issued_at}`
+  would let `gaia recover` on a `fire-ambiguous` run populate
+  `meta.session_url` from a late sentinel, which today stays
+  `null` on that path (§6.4). Cheap but not needed for
+  correctness — the URL is informational for debugging, not
+  load-bearing on recovery.
 - **Graduating `--experimental-mode` to stable** (§15). Once VM
   idle-lifetime is characterized empirically and the `Stop`-hook
   decision semantics are confirmed stable across Claude Code versions,
@@ -2655,6 +3275,16 @@ policy rather than by convention.
   the gap at the cost of breaking legitimate agent flexibility.
   Deferred until the observed failure-mode rate justifies the
   ergonomic cost.
+- **MCP / connector allow-list.** v1 bans all `mcp__*` tool
+  calls in gaia sessions (§2, §5, §8.5). Supporting them in
+  v1.x requires modeling each connector's write surface —
+  which paths / repos / APIs it can mutate — and composing
+  that model with gaia's protected-path set. The first
+  connectors to graduate are likely the read-only ones
+  (Linear, Sentry, etc.); write-capable ones (GitHub,
+  filesystem) require more careful policy design. A gaia
+  config entry (`spawner_config.allowed_mcp: ["linear",
+  "sentry"]`) is the planned surface.
 
 ## 15. Lab-quality mode: `--experimental-mode`
 
@@ -2735,7 +3365,7 @@ Flow:
    A  .gaia-state/<session_id>/pending_<T>.md    (Claude's latest response)
    ```
    The push uses the same **name-matched local-branch
-   temporary-worktree** flow as §8.2 step 7
+   temporary-worktree** flow as §8.2 step 9
    (`git worktree add -B "$GAIA_STATE_BRANCH" "$tmp"
    "refs/remotes/origin/$GAIA_STATE_BRANCH"` plus an explicit
    `$GAIA_STATE_BRANCH:$GAIA_STATE_BRANCH` refspec on push). Every
@@ -2855,7 +3485,7 @@ Lab-quality mode falls back to the standard stable path on any of:
 In every fallback case:
 
 - **No work is lost for clean exits.** The Stop hook's unconditional
-  push (§8.2 step 3) syncs work-branch state to origin in every clean-
+  push (§8.2 step 5) syncs work-branch state to origin in every clean-
   exit path. Unclean exits preserve the work branch on origin for
   `gaia recover`.
 - **Failed runs are first-class in recovery.** Each run writes a
